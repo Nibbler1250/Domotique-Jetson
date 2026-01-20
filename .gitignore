@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# Database
+*.db
+*.sqlite3
+
+# Environment
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+nohup.out
+
+# Node
+node_modules/
+.svelte-kit/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cache
+.cache/
