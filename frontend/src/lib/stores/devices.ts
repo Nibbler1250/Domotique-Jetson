@@ -56,10 +56,11 @@ function createDevicesStore() {
 		 */
 		updateDeviceState(deviceId: string, attribute: string, value: unknown) {
 			update((state) => {
-				// Find device by name/label (deviceId from MQTT is the device name)
+				// Find device by hubitat_id (deviceId from MQTT is the hubitat_id as string)
+				const hubitatId = parseInt(deviceId, 10);
 				let targetDevice: DeviceWithState | undefined;
 				for (const [, device] of state.devices) {
-					if (device.label === deviceId || device.name === deviceId) {
+					if (device.hubitat_id === hubitatId) {
 						targetDevice = device;
 						break;
 					}
@@ -89,9 +90,10 @@ function createDevicesStore() {
 				const newDevices = new Map(state.devices);
 
 				for (const [deviceKey, attributes] of Object.entries(deviceStates)) {
-					// Find device by name/label
+					// Find device by hubitat_id (deviceKey is hubitat_id as string)
+					const hubitatId = parseInt(deviceKey, 10);
 					for (const [id, device] of newDevices) {
-						if (device.label === deviceKey || device.name === deviceKey) {
+						if (device.hubitat_id === hubitatId) {
 							newDevices.set(id, {
 								...device,
 								state: { ...device.state, ...attributes }

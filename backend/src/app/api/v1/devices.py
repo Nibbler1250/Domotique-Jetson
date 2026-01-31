@@ -10,6 +10,7 @@ from app.db.database import get_connection
 from app.schemas.devices import DeviceCreate, DeviceResponse, DeviceUpdate, DeviceWithState
 from app.services import devices as device_service
 from app.services.mqtt import get_mqtt_service
+from app.services.activity_logs import log_activity, ActivityAction
 
 router = APIRouter(prefix="/devices", tags=["devices"])
 
@@ -37,9 +38,9 @@ async def list_devices(
     # Enrich with current state from MQTT
     enriched = []
     for device in devices_list:
-        # Get state by device label or name (MQTT topic uses label/name)
-        device_key = device.get("label") or device.get("name")
-        state = mqtt_service.get_device_state(device_key) or {}
+        # Get state by hubitat_id (MQTT topic format: {slug}-{hubitat_id})
+        hubitat_id = str(device.get("hubitat_id", ""))
+        state = mqtt_service.get_device_state(hubitat_id) or {}
         enriched.append({**device, "state": state})
 
     return api_response(enriched)
@@ -59,9 +60,9 @@ async def get_device(device_id: int, conn: AsyncConnection = Depends(get_conn)) 
     if not device:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Device not found")
 
-    # Get current state
-    device_key = device.get("label") or device.get("name")
-    state = mqtt_service.get_device_state(device_key) or {}
+    # Get current state by hubitat_id
+    hubitat_id = str(device.get("hubitat_id", ""))
+    state = mqtt_service.get_device_state(hubitat_id) or {}
 
     return api_response({**device, "state": state})
 
@@ -207,12 +208,24 @@ async def turn_device_on(
     device_id: int, conn: AsyncConnection = Depends(get_conn)
 ) -> dict[str, Any]:
     """Turn on a device."""
+    # Get device info for logging
+    device = await device_service.get_device_by_id(conn, device_id)
+    device_name = device.get("label") or device.get("name") if device else f"Device {device_id}"
+
     result = await send_device_command(device_id, "on", None, conn)
-    # Optimistic update: set switch_state to 'on' immediately
-    print(f"[DEBUG] Updating device {device_id} switch_state to 'on'")
+    # Optimistic update
     await device_service.update_device_state(conn, device_id, [{"name": "switch", "currentValue": "on"}])
+
+    # Log activity
+    await log_activity(
+        conn,
+        action=ActivityAction.DEVICE_ON,
+        resource_type="device",
+        resource_id=str(device_id),
+        resource_name=device_name,
+        details={"command": "on"},
+    )
     await conn.commit()
-    print(f"[DEBUG] Committed switch_state='on' for device {device_id}")
     return result
 
 
@@ -221,12 +234,24 @@ async def turn_device_off(
     device_id: int, conn: AsyncConnection = Depends(get_conn)
 ) -> dict[str, Any]:
     """Turn off a device."""
+    # Get device info for logging
+    device = await device_service.get_device_by_id(conn, device_id)
+    device_name = device.get("label") or device.get("name") if device else f"Device {device_id}"
+
     result = await send_device_command(device_id, "off", None, conn)
-    # Optimistic update: set switch_state to 'off' immediately
-    print(f"[DEBUG] Updating device {device_id} switch_state to 'off'")
+    # Optimistic update
     await device_service.update_device_state(conn, device_id, [{"name": "switch", "currentValue": "off"}])
+
+    # Log activity
+    await log_activity(
+        conn,
+        action=ActivityAction.DEVICE_OFF,
+        resource_type="device",
+        resource_id=str(device_id),
+        resource_name=device_name,
+        details={"command": "off"},
+    )
     await conn.commit()
-    print(f"[DEBUG] Committed switch_state='off' for device {device_id}")
     return result
 
 
@@ -236,12 +261,27 @@ async def set_device_level(
 ) -> dict[str, Any]:
     """Set device level (0-100)."""
     level = max(0, min(100, level))
+
+    # Get device info for logging
+    device = await device_service.get_device_by_id(conn, device_id)
+    device_name = device.get("label") or device.get("name") if device else f"Device {device_id}"
+
     result = await send_device_command(device_id, "setLevel", str(level), conn)
-    # Optimistic update: set level and switch state immediately
+    # Optimistic update
     switch_state = "on" if level > 0 else "off"
     await device_service.update_device_state(conn, device_id, [
         {"name": "level", "currentValue": level},
         {"name": "switch", "currentValue": switch_state}
     ])
+
+    # Log activity
+    await log_activity(
+        conn,
+        action=ActivityAction.DEVICE_SET_LEVEL,
+        resource_type="device",
+        resource_id=str(device_id),
+        resource_name=device_name,
+        details={"command": "setLevel", "level": level},
+    )
     await conn.commit()
     return result

@@ -46,18 +46,34 @@ class MQTTService:
             self._callbacks.remove(callback)
 
     def _parse_topic(self, topic: str) -> tuple[str, str] | None:
-        """Parse MQTT topic to extract device_id and attribute.
+        """Parse MQTT topic to extract hubitat_id and attribute.
 
-        Topic format: hubitat/genius-hub-000d/{device-name-id}/{attribute}
+        Topic format: hubitat/genius-hub-000d/{slugified-label}-{hubitat_id}/{attribute}
+        Example: hubitat/genius-hub-000d/plancher-cuisine-13/temperature
+        Returns: ("13", "temperature") - using hubitat_id as device key
         """
         parts = topic.split("/")
         if len(parts) < 4:
             return None
 
-        # Device name is parts[2], attribute is parts[3]
-        device_id = parts[2]
+        # Device slug is parts[2] (e.g., "plancher-cuisine-13")
+        # Extract hubitat_id from the end (last number after hyphen)
+        device_slug = parts[2]
         attribute = parts[3]
-        return device_id, attribute
+
+        # Extract hubitat_id: find the last hyphen and get the number after it
+        last_hyphen = device_slug.rfind("-")
+        if last_hyphen != -1:
+            potential_id = device_slug[last_hyphen + 1:]
+            if potential_id.isdigit():
+                hubitat_id = potential_id
+            else:
+                # No numeric ID found, use full slug as fallback
+                hubitat_id = device_slug
+        else:
+            hubitat_id = device_slug
+
+        return hubitat_id, attribute
 
     def _parse_value(self, payload: str) -> Any:
         """Parse payload value."""
