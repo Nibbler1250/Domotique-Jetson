@@ -16,6 +16,7 @@ from app.api.v1 import auth as auth_router
 from app.api.v1 import automations as automations_router
 from app.api.v1 import config as config_router
 from app.api.v1 import devices as devices_router
+from app.api.v1 import emails as emails_router
 from app.api.v1 import health as health_router
 from app.api.v1 import integrations as integrations_router
 from app.api.v1 import kiosk as kiosk_router
@@ -89,6 +90,7 @@ app.include_router(auth_router.router, prefix=settings.api_v1_prefix)
 app.include_router(automations_router.router, prefix=settings.api_v1_prefix)
 app.include_router(config_router.router, prefix=settings.api_v1_prefix)
 app.include_router(devices_router.router, prefix=settings.api_v1_prefix)
+app.include_router(emails_router.router, prefix=settings.api_v1_prefix)
 app.include_router(health_router.router, prefix=settings.api_v1_prefix)
 app.include_router(integrations_router.router, prefix=settings.api_v1_prefix)
 app.include_router(kiosk_router.router, prefix=settings.api_v1_prefix)
