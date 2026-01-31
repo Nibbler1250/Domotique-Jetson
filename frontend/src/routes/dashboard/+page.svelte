@@ -8,6 +8,12 @@
 	import { ActiveModeIndicator } from '$components/modes';
 	import { syncDevices } from '$lib/api/devices';
 	import { getActiveMode, type Mode } from '$lib/api/modes';
+	import {
+		getInvoiceStats,
+		getUpcomingDueDates,
+		type Invoice,
+		type InvoiceStats
+	} from '$lib/api/emails';
 
 	let user = $derived($auth.data);
 	let loading = $derived($devices.loading);
@@ -23,13 +29,38 @@
 	let activeTab = $state<'favorites' | 'all' | 'rooms'>('favorites');
 	let activeMode = $state<Mode | null>(null);
 
+	// Invoice data (Simon/Admin only)
+	let invoiceStats = $state<InvoiceStats | null>(null);
+	let upcomingInvoices = $state<Invoice[]>([]);
+
 	onMount(async () => {
 		// Connect WebSocket
 		websocket.connect();
 
 		// Load devices and active mode
 		await Promise.all([devices.load(), loadActiveMode()]);
+
+		// Load invoices for Simon/Admin
+		if (
+			$auth.data?.role === 'admin' ||
+			($auth.data?.role === 'family_adult' && $auth.data?.username === 'simon')
+		) {
+			await loadInvoiceData();
+		}
 	});
+
+	async function loadInvoiceData() {
+		try {
+			const [statsRes, upcomingRes] = await Promise.all([
+				getInvoiceStats(),
+				getUpcomingDueDates(3)
+			]);
+			invoiceStats = statsRes.data || null;
+			upcomingInvoices = upcomingRes.data || [];
+		} catch (e) {
+			console.error('Failed to load invoice data:', e);
+		}
+	}
 
 	async function loadActiveMode() {
 		try {
@@ -59,6 +90,16 @@
 		} finally {
 			syncing = false;
 		}
+	}
+
+	function formatAmount(amount: number | null): string {
+		if (amount === null) return '-';
+		return new Intl.NumberFormat('fr-CA', { style: 'currency', currency: 'CAD' }).format(amount);
+	}
+
+	function formatDate(dateStr: string | null): string {
+		if (!dateStr) return '-';
+		return new Date(dateStr).toLocaleDateString('fr-CA');
 	}
 </script>
 
@@ -155,6 +196,61 @@
 						<p class="text-sm text-white/80">Trading Dashboard</p>
 					</div>
 				</a>
+			</section>
+		{/if}
+
+		<!-- Emails/Factures (Simon/Admin only) -->
+		{#if hasTradingAccess && invoiceStats}
+			<section class="mb-6 rounded-xl bg-[var(--color-surface)] p-4 shadow-md">
+				<div class="mb-3 flex items-center justify-between">
+					<h2 class="flex items-center gap-2 text-lg font-semibold text-[var(--color-text)]">
+						<span>📧</span> Factures
+					</h2>
+					<a
+						href="/admin/emails"
+						class="text-sm text-[var(--color-primary)] hover:underline"
+					>
+						Voir tout
+					</a>
+				</div>
+
+				<!-- Stats -->
+				<div class="mb-4 grid grid-cols-3 gap-3">
+					<div class="rounded-lg bg-[var(--color-bg)] p-3 text-center">
+						<p class="text-2xl font-bold text-[var(--color-text)]">{invoiceStats.totals.total_invoices}</p>
+						<p class="text-xs text-[var(--color-text-muted)]">Total</p>
+					</div>
+					<div class="rounded-lg bg-red-50 p-3 text-center dark:bg-red-900/20">
+						<p class="text-2xl font-bold text-red-600">{invoiceStats.totals.unpaid_count}</p>
+						<p class="text-xs text-red-600">Non payées</p>
+					</div>
+					<div class="rounded-lg bg-[var(--color-bg)] p-3 text-center">
+						<p class="text-lg font-bold text-red-600">{formatAmount(invoiceStats.totals.unpaid_amount)}</p>
+						<p class="text-xs text-[var(--color-text-muted)]">À payer</p>
+					</div>
+				</div>
+
+				<!-- Upcoming due dates -->
+				{#if upcomingInvoices.length > 0}
+					<div class="space-y-2">
+						<p class="text-sm font-medium text-[var(--color-text-muted)]">Prochaines échéances</p>
+						{#each upcomingInvoices as invoice}
+							<div class="flex items-center justify-between rounded-lg bg-[var(--color-bg)] p-2 text-sm">
+								<span class="truncate text-[var(--color-text)]" title={invoice.subject}>
+									{invoice.sender}
+								</span>
+								<div class="flex items-center gap-2">
+									{#if invoice.amount}
+										<span class="font-medium text-[var(--color-text)]">
+											{formatAmount(invoice.amount)}
+										</span>
+									{/if}
+									<span class="text-orange-600">{formatDate(invoice.due_date)}</span>
+								</div>
+							</div>
+						{/each}
+					</div>
+				{/if}
 			</section>
 		{/if}
 
