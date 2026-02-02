@@ -7,6 +7,8 @@ Access restricted to admin or simon users.
 import asyncio
 import json
 import logging
+import os
+import threading
 from datetime import datetime, timezone
 from typing import Any
 
@@ -18,8 +20,7 @@ router = APIRouter(prefix="/trading", tags=["trading"])
 
 # MQTT Configuration - Jetson broker (where Momentum Trader V7 publishes)
 # Use localhost with SSH tunnel when direct Jetson access not available
-import os
-MQTT_BROKER = os.environ.get("MQTT_HOST", "127.0.0.1")  # Via SSH tunnel or direct
+MQTT_BROKER = os.environ.get("MQTT_HOST", "127.0.0.1")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "11883"))  # Tunnel port default
 MQTT_TOPICS = [
     "trader/services/#",
@@ -39,6 +40,8 @@ MQTT_TOPICS = [
     # V7.5: Margin Protection & Trading Config
     "trader/margin_protection/#",
     "trader/config/#",
+    # V7.25: Historical Statistics
+    "trader/history/#",
 ]
 
 
@@ -51,7 +54,10 @@ class TradingConnectionManager:
         self._mqtt_client: mqtt.Client | None = None
         self._mqtt_connected = False
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._retained_messages: dict[str, Any] = {}
+        # V7.46.21: Store retained messages with their original timestamps
+        # Format: {topic: {"payload": ..., "received_at": ...}}
+        self._retained_messages: dict[str, dict[str, Any]] = {}
+        self._retained_lock = threading.Lock()  # Thread-safe access from MQTT callback
 
     def _setup_mqtt(self) -> None:
         """Setup MQTT client for trader topics."""
@@ -68,24 +74,30 @@ class TradingConnectionManager:
         self._mqtt_client.on_message = self._on_mqtt_message
 
         try:
+            print(f"[MQTT DEBUG] Attempting connect to {MQTT_BROKER}:{MQTT_PORT}")
             self._mqtt_client.connect_async(MQTT_BROKER, MQTT_PORT, 60)
             self._mqtt_client.loop_start()
             logger.info(f"MQTT client connecting to {MQTT_BROKER}:{MQTT_PORT}")
+            print("[MQTT DEBUG] loop_start() called successfully")
         except Exception as e:
             logger.error(f"Failed to connect MQTT: {e}")
+            print(f"[MQTT DEBUG] Exception: {e}")
 
     def _on_mqtt_connect(
         self, client: mqtt.Client, userdata: Any, flags: Any, rc: int
     ) -> None:
         """Callback when MQTT connects."""
+        print(f"[MQTT DEBUG] on_connect callback fired with rc={rc}")
         if rc == 0:
             self._mqtt_connected = True
             logger.info("Trading MQTT connected, subscribing to trader topics")
+            print("[MQTT DEBUG] MQTT connected successfully!")
             for topic in MQTT_TOPICS:
                 client.subscribe(topic, qos=1)
                 logger.debug(f"Subscribed to {topic}")
         else:
             logger.error(f"Trading MQTT connection failed: {rc}")
+            print(f"[MQTT DEBUG] Connection failed with rc={rc}")
 
     def _on_mqtt_disconnect(
         self, client: mqtt.Client, userdata: Any, rc: int
@@ -102,17 +114,32 @@ class TradingConnectionManager:
         try:
             payload = json.loads(msg.payload.decode("utf-8"))
             topic = msg.topic
+            now = datetime.now(timezone.utc).isoformat()
 
-            # Store retained messages for new connections
+            # V7.46.21: Extract original timestamp from payload if available
+            # This ensures we don't mask stale data with fresh timestamps
+            payload_timestamp = None
+            if isinstance(payload, dict):
+                payload_timestamp = payload.get("timestamp")
+
+            # Use payload timestamp if available, otherwise current time
+            message_timestamp = payload_timestamp or now
+
+            # V7.46.21: Store retained messages with timestamp (thread-safe)
             if msg.retain:
-                self._retained_messages[topic] = payload
+                with self._retained_lock:
+                    self._retained_messages[topic] = {
+                        "payload": payload,
+                        "timestamp": message_timestamp,
+                        "received_at": now
+                    }
 
             # Create WebSocket message
             ws_message = {
                 "type": "mqtt",
                 "topic": topic,
                 "payload": payload,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": message_timestamp,
             }
 
             # Broadcast to all connected WebSocket clients
@@ -139,17 +166,23 @@ class TradingConnectionManager:
         if len(self.active_connections) == 1:
             self._setup_mqtt()
 
-        logger.info(f"Trading WebSocket connected. Total: {len(self.active_connections)}")
+        logger.info(
+            f"Trading WebSocket connected. Total: {len(self.active_connections)}"
+        )
 
-        # Send retained messages to new client
-        for topic, payload in self._retained_messages.items():
+        # V7.46.21: Send retained messages to new client (thread-safe copy)
+        # Use original timestamp to prevent showing stale data as fresh
+        with self._retained_lock:
+            retained_copy = dict(self._retained_messages)
+
+        for topic, data in retained_copy.items():
             try:
                 await websocket.send_text(
                     json.dumps({
                         "type": "mqtt",
                         "topic": topic,
-                        "payload": payload,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "payload": data["payload"],
+                        "timestamp": data["timestamp"],  # Original timestamp
                     })
                 )
             except Exception:
@@ -161,7 +194,9 @@ class TradingConnectionManager:
             if websocket in self.active_connections:
                 self.active_connections.remove(websocket)
 
-        logger.info(f"Trading WebSocket disconnected. Total: {len(self.active_connections)}")
+        logger.info(
+            f"Trading WebSocket disconnected. Total: {len(self.active_connections)}"
+        )
 
         # Stop MQTT if no connections
         if not self.active_connections and self._mqtt_client:
