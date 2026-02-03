@@ -111,7 +111,7 @@ export interface Position {
 	current_price: number;
 	unrealized_pnl: number;
 	pnl_percent: number;
-	asset_type: 'stock' | 'forex';
+	asset_type: 'stock' | 'forex' | 'etf' | 'penny_stock';  // V7.47.3: Added etf, penny_stock
 	entry_time: number;
 	score: number;
 	ml_score: number;  // V7.14: ML entry score for display
@@ -129,7 +129,7 @@ export interface ClosedTrade {
 	entry_price?: number;
 	exit_price?: number;
 	ml_score?: number;
-	asset_type?: 'stock' | 'forex';
+	asset_type?: 'stock' | 'forex' | 'etf' | 'penny_stock';  // V7.47.3
 	is_win?: boolean;
 }
 
@@ -146,6 +146,10 @@ export interface PortfolioSummary {
 	win_rate_today: number;
 	trades_today: number;
 	max_drawdown_today: number;
+	// V7.47.5: Risk-adjusted performance metrics
+	sharpe_ratio?: number;
+	sortino_ratio?: number;
+	profit_factor?: number;
 	timestamp?: string;
 }
 
@@ -943,7 +947,11 @@ export const portfolioMetrics = derived(trading, ($trading) => {
 		winRate: $trading.summary.win_rate_today,
 		positionsOpen: $trading.summary.positions_open,
 		tradesToday: $trading.summary.trades_today,
-		maxDrawdown: $trading.summary.max_drawdown_today
+		maxDrawdown: $trading.summary.max_drawdown_today,
+		// V7.47.5: Risk-adjusted performance metrics
+		sharpeRatio: $trading.summary.sharpe_ratio ?? 0,
+		sortinoRatio: $trading.summary.sortino_ratio ?? 0,
+		profitFactor: $trading.summary.profit_factor ?? 0
 	};
 });
 

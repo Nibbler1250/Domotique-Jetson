@@ -49,14 +49,17 @@
 	let selectedPosition = $state<Position | null>(null);
 
 	// V7.47.2: Chart modal state (for kiosk mode - can't navigate away)
-	let chartModal = $state<{ symbol: string; assetType: 'stock' | 'forex'; interval: string } | null>(null);
+	// V7.47.3: Extended to support etf, penny_stock types
+	type AssetType = 'stock' | 'forex' | 'etf' | 'penny_stock';
+	let chartModal = $state<{ symbol: string; assetType: AssetType; interval: string } | null>(null);
 	const chartIntervals = ['1', '5', '15', '60', 'D', 'W'] as const;
 
-	function openChart(symbol: string, assetType: 'stock' | 'forex' = 'stock', interval: string = '15') {
+	function openChart(symbol: string, assetType: AssetType = 'stock', interval: string = '15') {
 		chartModal = { symbol, assetType, interval };
 	}
 
-	function getChartUrl(symbol: string, assetType: 'stock' | 'forex', interval: string): string {
+	function getChartUrl(symbol: string, assetType: AssetType, interval: string): string {
+		// For TradingView: forex uses FX: prefix, everything else uses the symbol directly
 		const tvSymbol = assetType === 'forex' ? `FX:${symbol.replace('/', '')}` : symbol;
 		return `https://www.tradingview.com/widgetembed/?symbol=${tvSymbol}&interval=${interval}&theme=dark&style=1&locale=en&toolbar_bg=%23000000&enable_publishing=false&hide_top_toolbar=false&hide_legend=false&save_image=false&hide_volume=false`;
 	}
@@ -279,6 +282,21 @@
 		if (pnl > 0) return 'text-profit';
 		if (pnl < 0) return 'text-loss';
 		return 'text-muted';
+	}
+
+	// V7.47.3: Asset type styling helper
+	function getAssetTypeStyle(assetType: string | undefined): { bg: string; text: string; label: string } {
+		switch (assetType) {
+			case 'forex':
+				return { bg: 'bg-purple-500/20', text: 'text-purple-400', label: 'FOREX' };
+			case 'etf':
+				return { bg: 'bg-amber-500/20', text: 'text-amber-400', label: 'ETF' };
+			case 'penny_stock':
+				return { bg: 'bg-rose-500/20', text: 'text-rose-400', label: 'PENNY' };
+			case 'stock':
+			default:
+				return { bg: 'bg-info-dim', text: 'text-info', label: 'STOCK' };
+		}
 	}
 
 	function getStatusColor(status: string | undefined): string {
@@ -627,6 +645,26 @@
 								<div class="text-xs text-muted">Open</div>
 								<div class="text-lg font-bold tabular-nums text-info">{metrics.positionsOpen}</div>
 							</div>
+							<!-- V7.47.5: Risk-adjusted metrics -->
+							<div class="border-l border-terminal-border pl-4"></div>
+							<div class="text-center" title="Sharpe Ratio (annualized) - Risk-adjusted return">
+								<div class="text-xs text-muted">Sharpe</div>
+								<div class="text-lg font-bold tabular-nums" class:text-profit={metrics.sharpeRatio > 1} class:text-warning={metrics.sharpeRatio > 0 && metrics.sharpeRatio <= 1} class:text-loss={metrics.sharpeRatio <= 0}>
+									{metrics.sharpeRatio.toFixed(2)}
+								</div>
+							</div>
+							<div class="text-center" title="Sortino Ratio (annualized) - Downside risk-adjusted return">
+								<div class="text-xs text-muted">Sortino</div>
+								<div class="text-lg font-bold tabular-nums" class:text-profit={metrics.sortinoRatio > 1} class:text-warning={metrics.sortinoRatio > 0 && metrics.sortinoRatio <= 1} class:text-loss={metrics.sortinoRatio <= 0}>
+									{metrics.sortinoRatio.toFixed(2)}
+								</div>
+							</div>
+							<div class="text-center" title="Profit Factor - Gross profit / Gross loss">
+								<div class="text-xs text-muted">P.Factor</div>
+								<div class="text-lg font-bold tabular-nums" class:text-profit={metrics.profitFactor > 1.5} class:text-warning={metrics.profitFactor > 1 && metrics.profitFactor <= 1.5} class:text-loss={metrics.profitFactor <= 1}>
+									{metrics.profitFactor.toFixed(2)}
+								</div>
+							</div>
 						{/if}
 					</div>
 
@@ -688,6 +726,7 @@
 											</thead>
 											<tbody class="divide-y divide-terminal-border">
 												{#each $trading.positions as pos}
+													{@const assetStyle = getAssetTypeStyle(pos.asset_type)}
 													<tr
 														class="hover:bg-terminal-hover cursor-pointer transition-colors"
 														onclick={() => (selectedPosition = pos)}
@@ -697,12 +736,8 @@
 													>
 														<td class="px-3 py-2 font-medium">{pos.symbol}</td>
 														<td class="px-3 py-2">
-															<span class="rounded px-1.5 py-0.5 text-[10px] font-medium"
-																class:bg-info-dim={pos.asset_type === 'stock'}
-																class:text-info={pos.asset_type === 'stock'}
-																class:bg-purple-dim={pos.asset_type === 'forex'}
-																class:text-purple-400={pos.asset_type === 'forex'}>
-																{pos.asset_type.toUpperCase()}
+															<span class="rounded px-1.5 py-0.5 text-[10px] font-medium {assetStyle.bg} {assetStyle.text}">
+																{assetStyle.label}
 															</span>
 														</td>
 														<td class="px-3 py-2 text-right tabular-nums">
@@ -760,15 +795,16 @@
 								</div>
 								{#if $trading.closedToday.length > 0}
 									<div class="divide-y divide-terminal-border max-h-96 overflow-y-auto">
-										{#each $trading.closedToday as trade, i}
+										{#each $trading.closedToday as trade, i (trade.symbol + trade.exit_time)}
+											{@const tradeAssetStyle = getAssetTypeStyle(trade.asset_type)}
 											<details class="group">
 												<summary class="flex items-center justify-between px-3 py-2 hover:bg-terminal-hover cursor-pointer list-none">
 													<div class="flex items-center gap-2">
 														<!-- Win/Loss indicator -->
 														<span class="w-2 h-2 rounded-full {trade.is_win || trade.pnl > 0 ? 'bg-profit' : 'bg-loss'}"></span>
 														<span class="font-medium">{trade.symbol}</span>
-														<span class="text-xs px-1.5 py-0.5 rounded {trade.asset_type === 'forex' ? 'bg-blue-500/20 text-blue-400' : 'bg-purple-500/20 text-purple-400'}">
-															{trade.asset_type || 'stock'}
+														<span class="text-xs px-1.5 py-0.5 rounded {tradeAssetStyle.bg} {tradeAssetStyle.text}">
+															{tradeAssetStyle.label}
 														</span>
 														<span class="text-xs text-muted">{trade.exit_reason}</span>
 														<span class="text-xs text-muted">({trade.duration_min}m)</span>
