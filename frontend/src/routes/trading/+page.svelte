@@ -48,6 +48,19 @@
 	// Position detail modal state
 	let selectedPosition = $state<Position | null>(null);
 
+	// V7.47.2: Chart modal state (for kiosk mode - can't navigate away)
+	let chartModal = $state<{ symbol: string; assetType: 'stock' | 'forex'; interval: string } | null>(null);
+	const chartIntervals = ['1', '5', '15', '60', 'D', 'W'] as const;
+
+	function openChart(symbol: string, assetType: 'stock' | 'forex' = 'stock', interval: string = '15') {
+		chartModal = { symbol, assetType, interval };
+	}
+
+	function getChartUrl(symbol: string, assetType: 'stock' | 'forex', interval: string): string {
+		const tvSymbol = assetType === 'forex' ? `FX:${symbol.replace('/', '')}` : symbol;
+		return `https://www.tradingview.com/widgetembed/?symbol=${tvSymbol}&interval=${interval}&theme=dark&style=1&locale=en&toolbar_bg=%23000000&enable_publishing=false&hide_top_toolbar=false&hide_legend=false&save_image=false&hide_volume=false`;
+	}
+
 	// Collapsed states for panels
 	let scannerCollapsed = $state(false);
 	let servicesCollapsed = $state(false);
@@ -670,6 +683,7 @@
 													<th class="px-3 py-2 text-right font-medium text-muted">%</th>
 													<th class="px-3 py-2 text-right font-medium text-muted">Held</th>
 													<th class="px-3 py-2 text-right font-medium text-muted">ML</th>
+													<th class="px-3 py-2 text-center font-medium text-muted">Chart</th>
 												</tr>
 											</thead>
 											<tbody class="divide-y divide-terminal-border">
@@ -719,6 +733,15 @@
 																class:text-muted={(pos.ml_score || 0) <= 0.5}>
 																{((pos.ml_score || 0) * 100).toFixed(0)}%
 															</span>
+														</td>
+														<td class="px-3 py-2 text-center">
+															<button
+																onclick={(e) => { e.stopPropagation(); openChart(pos.symbol, pos.asset_type as 'stock' | 'forex', '15'); }}
+																class="px-2 py-1 rounded bg-terminal-card hover:bg-terminal-hover text-xs"
+																title="View Chart"
+															>
+																📊
+															</button>
 														</td>
 													</tr>
 												{/each}
@@ -792,22 +815,26 @@
 															</div>
 														{/if}
 													</div>
-													<!-- Chart button -->
+													<!-- Chart button - V7.47.2: Opens modal instead of navigating (kiosk compatible) -->
 													<div class="mt-2 flex gap-2">
-														<a
-															href="https://www.tradingview.com/chart/?symbol={trade.asset_type === 'forex' ? 'FX:' + trade.symbol.replace('/', '') : trade.symbol}"
-															target="_blank"
+														<button
+															onclick={() => openChart(trade.symbol, trade.asset_type || 'stock', '15')}
 															class="inline-flex items-center gap-1 px-2 py-1 rounded bg-terminal-border hover:bg-terminal-hover text-xs"
 														>
-															📊 TradingView
-														</a>
-														<a
-															href="https://finviz.com/quote.ashx?t={trade.symbol}&p=d"
-															target="_blank"
-															class="inline-flex items-center gap-1 px-2 py-1 rounded bg-terminal-border hover:bg-terminal-hover text-xs {trade.asset_type === 'forex' ? 'hidden' : ''}"
+															📊 Chart
+														</button>
+														<button
+															onclick={() => openChart(trade.symbol, trade.asset_type || 'stock', '60')}
+															class="inline-flex items-center gap-1 px-2 py-1 rounded bg-terminal-border hover:bg-terminal-hover text-xs"
 														>
-															📈 FinViz
-														</a>
+															📊 1H
+														</button>
+														<button
+															onclick={() => openChart(trade.symbol, trade.asset_type || 'stock', 'D')}
+															class="inline-flex items-center gap-1 px-2 py-1 rounded bg-terminal-border hover:bg-terminal-hover text-xs"
+														>
+															📊 Daily
+														</button>
 													</div>
 												</div>
 											</details>
@@ -1440,6 +1467,59 @@
 
 <!-- Position Detail Modal -->
 <PositionDetailModal position={selectedPosition} onClose={() => (selectedPosition = null)} />
+
+<!-- V7.47.2: Chart Modal (kiosk-compatible - no navigation away) -->
+{#if chartModal}
+	<div
+		class="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4"
+		onclick={() => chartModal = null}
+		onkeydown={(e) => e.key === 'Escape' && (chartModal = null)}
+		role="dialog"
+		aria-modal="true"
+		tabindex="-1"
+	>
+		<div
+			class="bg-terminal-panel border border-terminal-border rounded-lg w-full max-w-6xl h-[80vh] flex flex-col"
+			onclick={(e) => e.stopPropagation()}
+		>
+			<!-- Header -->
+			<div class="flex items-center justify-between px-4 py-3 border-b border-terminal-border">
+				<div class="flex items-center gap-4">
+					<h2 class="text-lg font-medium">{chartModal.symbol}</h2>
+					<span class="text-xs px-2 py-1 rounded {chartModal.assetType === 'forex' ? 'bg-blue-500/20 text-blue-400' : 'bg-purple-500/20 text-purple-400'}">
+						{chartModal.assetType}
+					</span>
+					<!-- Interval selector -->
+					<div class="flex gap-1">
+						{#each chartIntervals as interval}
+							<button
+								class="px-2 py-1 text-xs rounded {chartModal.interval === interval ? 'bg-info text-white' : 'bg-terminal-card hover:bg-terminal-hover'}"
+								onclick={() => chartModal = { ...chartModal, interval }}
+							>
+								{interval === '1' ? '1m' : interval === '5' ? '5m' : interval === '15' ? '15m' : interval === '60' ? '1H' : interval === 'D' ? 'Day' : 'Week'}
+							</button>
+						{/each}
+					</div>
+				</div>
+				<button
+					onclick={() => chartModal = null}
+					class="p-2 rounded hover:bg-terminal-hover text-xl"
+				>
+					✕
+				</button>
+			</div>
+			<!-- Chart iframe -->
+			<div class="flex-1 p-2">
+				<iframe
+					src={getChartUrl(chartModal.symbol, chartModal.assetType, chartModal.interval)}
+					title="TradingView Chart"
+					class="w-full h-full rounded border-0"
+					allowfullscreen
+				></iframe>
+			</div>
+		</div>
+	</div>
+{/if}
 
 <style>
 	/* Terminal Dark Theme Colors */
