@@ -2,6 +2,10 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { auth } from '$stores/auth';
+	import HistoryChart from '$lib/components/trading/HistoryChart.svelte';
+	import PositionDetailModal from '$lib/components/trading/PositionDetailModal.svelte';
+	import { QuickThemePicker } from '$lib/components/settings';
+	import type { Position } from '$lib/stores/trading';
 	import {
 		trading,
 		servicesHealth,
@@ -34,8 +38,23 @@
 	let pipeline = $derived($trading.pipeline);
 	let recommendations = $derived($trading.recommendations);
 
-	// Active tab
-	let activeTab = $state<'overview' | 'services' | 'positions' | 'scanner' | 'capital'>('overview');
+	// Active view for center panel
+	let activeView = $state<'positions' | 'scanner' | 'history'>('positions');
+
+	// Settings modal state
+	let showSettingsModal = $state(false);
+	let settingsTab = $state<'limits' | 'budget' | 'margin' | 'services'>('limits');
+
+	// Position detail modal state
+	let selectedPosition = $state<Position | null>(null);
+
+	// Collapsed states for panels
+	let scannerCollapsed = $state(false);
+	let servicesCollapsed = $state(false);
+
+	// V7.25: History data
+	let historySummary = $derived($trading.historySummary);
+	let allTimeStats = $derived($trading.allTimeStats);
 
 	// V7.4: Capital & Control data
 	let account = $derived($trading.account);
@@ -47,6 +66,12 @@
 	let marginConfig = $derived($trading.marginProtectionConfig);
 	let marginScores = $derived($trading.marginProtectionScores);
 	let tradingConfig = $derived($trading.tradingConfig);
+
+	// V7.26: Position Size Limits
+	let positionLimits = $derived($trading.positionLimits);
+
+	// V7.29: Budget Allocation
+	let budgetConfig = $derived($trading.budgetConfig);
 
 	// Local state for editing margin protection weights
 	let editingWeights = $state(false);
@@ -77,6 +102,76 @@
 			tempMaxPositions = tradingConfig.max_positions;
 		}
 	});
+
+	// V7.13: Min cushion for entry blocking
+	let tempMinCushion = $state(10);
+
+	$effect(() => {
+		if (marginConfig) {
+			tempMinCushion = Math.round(marginConfig.min_cushion_pct * 100);
+		}
+	});
+
+	function saveMinCushion() {
+		if (tempMinCushion < 1 || tempMinCushion > 50) {
+			alert('Min cushion must be between 1% and 50%');
+			return;
+		}
+		trading.updateMinCushion(tempMinCushion / 100);
+	}
+
+	// V7.26: Position Size Limits
+	let tempStockMaxValue = $state(5000);
+	let tempForexMaxValue = $state(5000);
+
+	$effect(() => {
+		if (positionLimits) {
+			tempStockMaxValue = positionLimits.stock?.max_position_value ?? 5000;
+			tempForexMaxValue = positionLimits.forex?.max_position_value ?? 5000;
+		}
+	});
+
+	function savePositionLimits() {
+		if (tempStockMaxValue < 100 || tempStockMaxValue > 50000) {
+			alert('Stock max must be between $100 and $50,000');
+			return;
+		}
+		if (tempForexMaxValue < 100 || tempForexMaxValue > 100000) {
+			alert('Forex max must be between $100 and $100,000');
+			return;
+		}
+		trading.updatePositionLimits(tempStockMaxValue, tempForexMaxValue);
+	}
+
+	// V7.29: Budget Allocation
+	let tempStockBudgetPct = $state(60);
+	let tempForexBudgetPct = $state(30);
+	let tempEnforceBudgetLimits = $state(true);
+
+	$effect(() => {
+		if (budgetConfig) {
+			tempStockBudgetPct = budgetConfig.allocation?.stock_percent ?? 60;
+			tempForexBudgetPct = budgetConfig.allocation?.forex_percent ?? 30;
+			tempEnforceBudgetLimits = budgetConfig.enforce_limits ?? true;
+		}
+	});
+
+	function saveBudgetAllocation() {
+		const total = tempStockBudgetPct + tempForexBudgetPct;
+		if (total > 100) {
+			alert(`Stock + Forex cannot exceed 100% (currently ${total}%)`);
+			return;
+		}
+		if (tempStockBudgetPct < 0 || tempStockBudgetPct > 100) {
+			alert('Stock budget must be between 0% and 100%');
+			return;
+		}
+		if (tempForexBudgetPct < 0 || tempForexBudgetPct > 100) {
+			alert('Forex budget must be between 0% and 100%');
+			return;
+		}
+		trading.updateBudgetAllocation(tempStockBudgetPct, tempForexBudgetPct, tempEnforceBudgetLimits);
+	}
 
 	function getTotalWeight(): number {
 		return tempWeights.weight_ml_exit + tempWeights.weight_pnl_negative +
@@ -114,6 +209,7 @@
 		trading.disconnect();
 	});
 
+	// Formatting functions
 	function formatCurrency(value: number): string {
 		return new Intl.NumberFormat('en-CA', {
 			style: 'currency',
@@ -122,14 +218,54 @@
 		}).format(value);
 	}
 
+	function formatCurrencyCompact(value: number): string {
+		if (Math.abs(value) >= 1000000) {
+			return `$${(value / 1000000).toFixed(2)}M`;
+		}
+		if (Math.abs(value) >= 1000) {
+			return `$${(value / 1000).toFixed(1)}K`;
+		}
+		return formatCurrency(value);
+	}
+
 	function formatPercent(value: number): string {
 		return `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
+	}
+
+	function formatHeldTime(entryTime: number | undefined): string {
+		if (!entryTime) return '-';
+		const now = Date.now() / 1000;
+		const seconds = now - entryTime;
+
+		// V7.47: Handle negative values (clock skew between trader and browser)
+		if (seconds < 0) {
+			return 'just now';
+		}
+
+		if (seconds < 60) return `${Math.floor(seconds)}s`;
+		if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+		if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+		const days = Math.floor(seconds / 86400);
+		const hours = Math.floor((seconds % 86400) / 3600);
+		return `${days}d ${hours}h`;
 	}
 
 	function formatTime(isoString: string | null): string {
 		if (!isoString) return 'N/A';
 		const date = new Date(isoString);
-		return date.toLocaleTimeString('fr-CA', { hour: '2-digit', minute: '2-digit' });
+		return date.toLocaleTimeString('en-CA', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+	}
+
+	function getLatencyColor(latency: number): string {
+		if (latency < 50) return 'text-profit';
+		if (latency < 200) return 'text-warning';
+		return 'text-loss';
+	}
+
+	function getPnlColor(pnl: number): string {
+		if (pnl > 0) return 'text-profit';
+		if (pnl < 0) return 'text-loss';
+		return 'text-muted';
 	}
 
 	function getStatusColor(status: string | undefined): string {
@@ -137,832 +273,784 @@
 			case 'HEALTHY':
 			case 'CONNECTED':
 			case 'RUNNING':
-				return 'bg-green-500';
+				return 'bg-profit';
 			case 'DEGRADED':
 			case 'PAUSED':
-				return 'bg-yellow-500';
+				return 'bg-warning';
 			case 'DOWN':
 			case 'DISCONNECTED':
 			case 'STOPPED':
-				return 'bg-red-500';
+				return 'bg-loss';
 			default:
-				return 'bg-gray-400';
+				return 'bg-muted';
 		}
 	}
 
-	function getPnlColor(pnl: number): string {
-		if (pnl > 0) return 'text-green-500';
-		if (pnl < 0) return 'text-red-500';
-		return 'text-gray-400';
+	// Keyboard shortcuts
+	function handleKeydown(e: KeyboardEvent) {
+		if (e.key === 'Escape') showSettingsModal = false;
+		if (e.key === '1' && e.ctrlKey) { activeView = 'positions'; e.preventDefault(); }
+		if (e.key === '2' && e.ctrlKey) { activeView = 'scanner'; e.preventDefault(); }
+		if (e.key === '3' && e.ctrlKey) { activeView = 'history'; e.preventDefault(); }
 	}
 </script>
 
 <svelte:head>
-	<title>Trading - Family Hub</title>
+	<title>Trading Terminal - Momentum V7</title>
 </svelte:head>
 
+<svelte:window on:keydown={handleKeydown} />
+
 {#if !hasAccess}
-	<div class="flex min-h-screen items-center justify-center bg-[var(--color-bg)]">
+	<div class="flex min-h-screen items-center justify-center bg-terminal-base">
 		<div class="text-center">
-			<h1 class="text-2xl font-bold text-red-500">Access Denied</h1>
-			<p class="mt-2 text-[var(--color-text-muted)]">This section is restricted to admin users.</p>
-			<a href="/dashboard" class="mt-4 inline-block text-[var(--color-primary)] underline"
-				>Back to Dashboard</a
-			>
+			<h1 class="text-2xl font-bold text-loss">Access Denied</h1>
+			<p class="mt-2 text-muted">This section is restricted to admin users.</p>
+			<a href="/dashboard" class="mt-4 inline-block text-info underline">Back to Dashboard</a>
 		</div>
 	</div>
 {:else}
-	<div class="min-h-screen bg-[var(--color-bg)]">
-		<!-- Header -->
-		<header
-			class="sticky top-0 z-10 border-b border-[var(--color-border)] bg-[var(--color-surface)]"
-		>
-			<div class="mx-auto flex max-w-7xl items-center justify-between px-4 py-3">
-				<div class="flex items-center gap-3">
-					<a href="/dashboard" class="text-[var(--color-text-muted)] hover:text-[var(--color-text)]">
-						<svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-							<path
-								stroke-linecap="round"
-								stroke-linejoin="round"
-								stroke-width="2"
-								d="M15 19l-7-7 7-7"
-							></path>
-						</svg>
-					</a>
-					<div
-						class="flex h-9 w-9 items-center justify-center rounded-full bg-gradient-to-br from-green-500 to-emerald-600"
-					>
-						<svg class="h-5 w-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-							<path
-								stroke-linecap="round"
-								stroke-linejoin="round"
-								stroke-width="2"
-								d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"
-							></path>
-						</svg>
+	<div class="flex h-screen flex-col bg-terminal-base text-primary font-mono">
+		<!-- ==================== HEADER BAR (48px) ==================== -->
+		<header class="flex h-12 items-center justify-between border-b border-terminal-border bg-terminal-panel px-3">
+			<div class="flex items-center gap-4">
+				<!-- Logo & Title -->
+				<a href="/dashboard" class="flex items-center gap-2 text-muted hover:text-primary transition-colors">
+					<svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path>
+					</svg>
+				</a>
+				<div class="flex items-center gap-2">
+					<div class="flex h-7 w-7 items-center justify-center rounded bg-gradient-to-br from-profit to-emerald-600">
+						<span class="text-xs font-bold text-white">M7</span>
 					</div>
-					<h1 class="text-lg font-semibold text-[var(--color-text)]">Momentum Trader V7</h1>
+					<span class="text-sm font-semibold">Momentum Trader V7</span>
+				</div>
 
-					<!-- Connection status -->
-					<span
-						class="h-2 w-2 rounded-full"
-						class:bg-green-500={connected}
-						class:bg-red-500={!connected}
-						class:animate-pulse={connected}
-						title={connected ? 'Connected' : 'Disconnected'}
-					></span>
-
-					<!-- Trader Status with stale detection -->
-					<span
-						class="rounded-full px-2 py-0.5 text-xs font-medium"
-						class:bg-green-100={status.status === 'RUNNING'}
-						class:text-green-800={status.status === 'RUNNING'}
-						class:bg-yellow-100={status.status === 'PAUSED'}
-						class:text-yellow-800={status.status === 'PAUSED'}
-						class:bg-red-100={status.status === 'STOPPED' || status.status === 'OFFLINE'}
-						class:text-red-800={status.status === 'STOPPED' || status.status === 'OFFLINE'}
-						class:bg-gray-100={status.status === 'UNKNOWN'}
-						class:text-gray-800={status.status === 'UNKNOWN'}
-						title={status.reason}
-					>
-						{#if status.mode}{status.mode} - {/if}{status.status}
-						{#if status.isStale}
-							<span class="ml-1 text-red-500">⚠</span>
-						{/if}
+				<!-- Connection Status -->
+				<div class="flex items-center gap-2 text-xs">
+					<span class="relative flex h-2 w-2">
+						<span class="absolute inline-flex h-full w-full animate-ping rounded-full opacity-75"
+							class:bg-profit={connected}
+							class:bg-loss={!connected}></span>
+						<span class="relative inline-flex h-2 w-2 rounded-full"
+							class:bg-profit={connected}
+							class:bg-loss={!connected}></span>
+					</span>
+					<span class:text-profit={connected} class:text-loss={!connected}>
+						{connected ? 'LIVE' : 'OFFLINE'}
 					</span>
 				</div>
 
-				<div class="flex items-center gap-3 text-sm text-[var(--color-text-muted)]">
-					{#if lastUpdate}
-						<span>Last update: {formatTime(lastUpdate)}</span>
-					{/if}
-					{#if $hasErrors}
-						<span class="flex items-center gap-1 text-red-500">
-							<svg class="h-4 w-4" fill="currentColor" viewBox="0 0 20 20">
-								<path
-									fill-rule="evenodd"
-									d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z"
-									clip-rule="evenodd"
-								></path>
-							</svg>
-							{errors?.errors_1h} errors
-						</span>
-					{/if}
+				<!-- Trader Status Badge -->
+				<div class="rounded px-2 py-0.5 text-xs font-medium"
+					class:bg-profit-dim={status.status === 'RUNNING'}
+					class:text-profit={status.status === 'RUNNING'}
+					class:bg-warning-dim={status.status === 'PAUSED'}
+					class:text-warning={status.status === 'PAUSED'}
+					class:bg-loss-dim={status.status === 'STOPPED' || status.status === 'OFFLINE'}
+					class:text-loss={status.status === 'STOPPED' || status.status === 'OFFLINE'}
+					class:bg-terminal-card={status.status === 'UNKNOWN'}
+					class:text-muted={status.status === 'UNKNOWN'}>
+					{#if status.mode}<span class="opacity-70">{status.mode}</span> · {/if}{status.status}
+					{#if status.isStale}<span class="ml-1 text-loss">!</span>{/if}
 				</div>
+			</div>
+
+			<div class="flex items-center gap-4 text-xs">
+				<!-- IBKR Latency -->
+				{#if ibkr}
+					<div class="flex items-center gap-2">
+						<span class="text-muted">IBKR</span>
+						<span class={getLatencyColor(ibkr.latency_ms)}>{ibkr.latency_ms}ms</span>
+					</div>
+				{/if}
+
+				<!-- Last Update -->
+				{#if lastUpdate}
+					<span class="text-muted">{formatTime(lastUpdate)}</span>
+				{/if}
+
+				<!-- Error Count -->
+				{#if $hasErrors}
+					<span class="flex items-center gap-1 text-loss">
+						<svg class="h-3 w-3" fill="currentColor" viewBox="0 0 20 20">
+							<path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" clip-rule="evenodd"></path>
+						</svg>
+						{errors?.errors_1h}
+					</span>
+				{/if}
+
+				<!-- Theme Picker -->
+				<QuickThemePicker />
+
+				<!-- Settings Button -->
+				<button
+					onclick={() => showSettingsModal = true}
+					class="rounded p-1 text-muted hover:text-primary hover:bg-terminal-hover transition-colors"
+					title="Settings (Position Limits, Budget, Margin)">
+					<svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path>
+						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+					</svg>
+				</button>
 			</div>
 		</header>
 
-		<!-- Tab Navigation -->
-		<div class="border-b border-[var(--color-border)] bg-[var(--color-surface)]">
-			<div class="mx-auto max-w-7xl px-4">
-				<div class="flex gap-1">
-					{#each [
-						{ id: 'overview', label: 'Overview', icon: '📊' },
-						{ id: 'capital', label: 'Capital', icon: '💰' },
-						{ id: 'services', label: 'Services', icon: '🔧' },
-						{ id: 'positions', label: 'Positions', icon: '💼' },
-						{ id: 'scanner', label: 'Scanner', icon: '🔍' }
-					] as tab}
-						<button
-							onclick={() => (activeTab = tab.id as typeof activeTab)}
-							class="flex items-center gap-2 border-b-2 px-4 py-3 text-sm font-medium transition-colors"
-							class:border-[var(--color-primary)]={activeTab === tab.id}
-							class:text-[var(--color-primary)]={activeTab === tab.id}
-							class:border-transparent={activeTab !== tab.id}
-							class:text-[var(--color-text-muted)]={activeTab !== tab.id}
-							class:hover:text-[var(--color-text)]={activeTab !== tab.id}
-						>
-							<span>{tab.icon}</span>
-							{tab.label}
-						</button>
-					{/each}
-				</div>
-			</div>
-		</div>
-
-		<!-- Error Banner -->
+		<!-- Error/Stale Banner -->
 		{#if error}
-			<div class="bg-red-100 px-4 py-2 text-center text-sm text-red-700 dark:bg-red-900/30">
-				{error}
-			</div>
+			<div class="bg-loss-dim px-4 py-1.5 text-center text-xs text-loss">{error}</div>
 		{/if}
-
-		<!-- Stale Data Warning Banner -->
 		{#if status.isStale && status.status === 'OFFLINE'}
-			<div class="bg-orange-100 px-4 py-2 text-center text-sm text-orange-700 dark:bg-orange-900/30">
-				⚠️ Trader appears offline - no heartbeat received for 90+ seconds. Data shown may be stale.
-				{#if status.lastUpdate}
-					Last update: {formatTime(status.lastUpdate)}
-				{/if}
+			<div class="bg-warning-dim px-4 py-1.5 text-center text-xs text-warning">
+				No heartbeat for 90+ seconds. Data may be stale.
+				{#if status.lastUpdate} Last: {formatTime(status.lastUpdate)}{/if}
 			</div>
 		{/if}
 
-		<!-- Main Content -->
-		<main class="mx-auto max-w-7xl px-4 py-6">
-			{#if activeTab === 'overview'}
-				<!-- Overview Tab -->
-				<div class="grid grid-cols-1 gap-6 lg:grid-cols-3">
-					<!-- Portfolio Summary Card -->
-					<div class="rounded-xl bg-[var(--color-surface)] p-6 shadow-sm lg:col-span-2">
-						<h2 class="mb-4 text-lg font-semibold text-[var(--color-text)]">Portfolio</h2>
-						{#if metrics}
-							<div class="grid grid-cols-2 gap-4 md:grid-cols-4">
-								<div>
-									<p class="text-sm text-[var(--color-text-muted)]">Equity</p>
-									<p class="text-2xl font-bold text-[var(--color-text)]">
-										{formatCurrency(metrics.equity)}
-									</p>
-								</div>
-								<div>
-									<p class="text-sm text-[var(--color-text-muted)]">P&L Total</p>
-									<p class="text-2xl font-bold {getPnlColor(metrics.pnlTotal)}">
-										{formatCurrency(metrics.pnlTotal)}
-									</p>
-									<p class="text-sm {getPnlColor(metrics.pnlPct)}">{formatPercent(metrics.pnlPct)}</p>
-								</div>
-								<div>
-									<p class="text-sm text-[var(--color-text-muted)]">Win Rate</p>
-									<p class="text-2xl font-bold text-[var(--color-text)]">
-										{metrics.winRate.toFixed(0)}%
-									</p>
-								</div>
-								<div>
-									<p class="text-sm text-[var(--color-text-muted)]">Trades Today</p>
-									<p class="text-2xl font-bold text-[var(--color-text)]">{metrics.tradesToday}</p>
-									<p class="text-sm text-[var(--color-text-muted)]">
-										{metrics.positionsOpen} open
-									</p>
-								</div>
-							</div>
-						{:else}
-							<p class="text-[var(--color-text-muted)]">Waiting for data...</p>
-						{/if}
-					</div>
-
-					<!-- Services Health Card -->
-					<div class="rounded-xl bg-[var(--color-surface)] p-6 shadow-sm">
-						<h2 class="mb-4 text-lg font-semibold text-[var(--color-text)]">Services Health</h2>
-						{#if status.isStale}
-							<!-- Show offline state when data is stale -->
-							<div class="flex items-center gap-4">
-								<div class="flex h-16 w-16 items-center justify-center rounded-full bg-red-100 dark:bg-red-900/30">
-									<span class="text-2xl font-bold text-red-500">⚠</span>
-								</div>
-								<div class="flex-1">
-									<p class="text-red-500 font-medium">Trader Offline</p>
-									<p class="text-sm text-[var(--color-text-muted)]">No heartbeat received</p>
-								</div>
-							</div>
-						{:else}
-						<div class="flex items-center gap-4">
-							<div class="flex h-16 w-16 items-center justify-center rounded-full bg-gray-100 dark:bg-gray-800">
-								<span class="text-2xl font-bold text-[var(--color-text)]">
-									{health.healthy}/{health.total}
-								</span>
-							</div>
-							<div class="flex-1">
-								<div class="mb-2 flex gap-2">
-									<span class="flex items-center gap-1 text-sm text-green-500">
-										<span class="h-2 w-2 rounded-full bg-green-500"></span>
-										{health.healthy} OK
-									</span>
-									{#if health.degraded > 0}
-										<span class="flex items-center gap-1 text-sm text-yellow-500">
-											<span class="h-2 w-2 rounded-full bg-yellow-500"></span>
-											{health.degraded} Degraded
-										</span>
-									{/if}
-									{#if health.down > 0}
-										<span class="flex items-center gap-1 text-sm text-red-500">
-											<span class="h-2 w-2 rounded-full bg-red-500"></span>
-											{health.down} Down
-										</span>
-									{/if}
-								</div>
-								<!-- Progress bar -->
-								<div class="h-2 overflow-hidden rounded-full bg-gray-200 dark:bg-gray-700">
-									<div
-										class="h-full bg-green-500"
-										style="width: {(health.healthy / health.total) * 100}%"
-									></div>
-								</div>
-							</div>
+		<!-- ==================== MAIN 3-PANEL LAYOUT ==================== -->
+		<div class="flex flex-1 overflow-hidden">
+			<!-- ==================== LEFT PANEL (Account & Controls) ==================== -->
+			<aside class="flex w-56 flex-col border-r border-terminal-border bg-terminal-panel">
+				<!-- P&L Banner -->
+				<div class="border-b border-terminal-border p-3">
+					<div class="text-xs text-muted uppercase tracking-wide mb-1">Total P&L</div>
+					{#if metrics}
+						<div class="text-2xl font-bold tabular-nums {getPnlColor(metrics.pnlTotal)}">
+							{formatCurrency(metrics.pnlTotal)}
 						</div>
-						{/if}
-					</div>
-
-					<!-- Top Positions -->
-					<div class="rounded-xl bg-[var(--color-surface)] p-6 shadow-sm lg:col-span-2">
-						<h2 class="mb-4 text-lg font-semibold text-[var(--color-text)]">Top Positions</h2>
-						{#if positions.length > 0}
-							<div class="space-y-3">
-								{#each positions as pos}
-									<div
-										class="flex items-center justify-between rounded-lg bg-[var(--color-bg)] p-3"
-									>
-										<div class="flex items-center gap-3">
-											<span
-												class="rounded px-2 py-0.5 text-xs font-medium"
-												class:bg-blue-100={pos.asset_type === 'stock'}
-												class:text-blue-800={pos.asset_type === 'stock'}
-												class:bg-purple-100={pos.asset_type === 'forex'}
-												class:text-purple-800={pos.asset_type === 'forex'}
-											>
-												{pos.asset_type.toUpperCase()}
-											</span>
-											<div>
-												<p class="font-medium text-[var(--color-text)]">{pos.symbol}</p>
-												<p class="text-xs text-[var(--color-text-muted)]">Qty: {pos.quantity}</p>
-											</div>
-										</div>
-										<div class="text-right">
-											<p class="font-medium {getPnlColor(pos.unrealized_pnl)}">{formatCurrency(pos.unrealized_pnl)}</p>
-											<p class="text-xs {getPnlColor(pos.pnl_percent)}">{formatPercent(pos.pnl_percent)}</p>
-										</div>
-									</div>
-								{/each}
-							</div>
-						{:else}
-							<p class="text-center text-[var(--color-text-muted)]">No positions</p>
-						{/if}
-					</div>
-
-					<!-- IBKR Connection -->
-					<div class="rounded-xl bg-[var(--color-surface)] p-6 shadow-sm">
-						<h2 class="mb-4 text-lg font-semibold text-[var(--color-text)]">IBKR Connection</h2>
-						{#if ibkr}
-							<div class="space-y-3">
-								<div class="flex items-center justify-between">
-									<span class="text-[var(--color-text-muted)]">Status</span>
-									<span class="flex items-center gap-2">
-										<span class="h-2 w-2 rounded-full {getStatusColor(ibkr.status)}"></span>
-										{ibkr.status}
-									</span>
-								</div>
-								<div class="flex items-center justify-between">
-									<span class="text-[var(--color-text-muted)]">Latency</span>
-									<span class="text-[var(--color-text)]">{ibkr.latency_ms}ms</span>
-								</div>
-								<div class="flex items-center justify-between">
-									<span class="text-[var(--color-text-muted)]">Account</span>
-									<span class="font-mono text-sm text-[var(--color-text)]">{ibkr.account}</span>
-								</div>
-								<div class="flex items-center justify-between">
-									<span class="text-[var(--color-text-muted)]">Data Farm</span>
-									<span class="text-[var(--color-text)]">{ibkr.data_farm}</span>
-								</div>
-							</div>
-						{:else}
-							<p class="text-[var(--color-text-muted)]">Waiting for data...</p>
-						{/if}
-					</div>
+						<div class="flex gap-2 text-xs mt-1">
+							<span class={getPnlColor(metrics.pnlUnrealized)}>Unreal: {formatCurrencyCompact(metrics.pnlUnrealized)}</span>
+							<span class="text-muted">|</span>
+							<span class={getPnlColor(metrics.pnlRealized)}>Real: {formatCurrencyCompact(metrics.pnlRealized)}</span>
+						</div>
+					{:else}
+						<div class="text-muted">---</div>
+					{/if}
 				</div>
 
-			{:else if activeTab === 'capital'}
-				<!-- Capital Tab - V7.4 -->
-				<div class="grid grid-cols-1 gap-6 lg:grid-cols-3">
-					<!-- Market Controls Card -->
-					<div class="rounded-xl bg-[var(--color-surface)] p-6 shadow-sm lg:col-span-3">
-						<h2 class="mb-4 text-lg font-semibold text-[var(--color-text)]">Market Controls</h2>
-						<div class="grid grid-cols-1 gap-6 md:grid-cols-2">
-							<!-- Stock Trading Toggle -->
-							<div class="rounded-lg bg-[var(--color-bg)] p-4">
-								<div class="flex items-center justify-between">
-									<div class="flex items-center gap-3">
-										<span class="flex h-10 w-10 items-center justify-center rounded-full bg-blue-100 text-xl dark:bg-blue-900">📈</span>
-										<div>
-											<h3 class="font-medium text-[var(--color-text)]">Stock Trading</h3>
-											<p class="text-sm text-[var(--color-text-muted)]">
-												{marketControl?.stock_enabled ? 'Active' : 'Disabled'}
-												{#if marketControl?.stock_reason}
-													- {marketControl.stock_reason}
-												{/if}
-											</p>
-										</div>
-									</div>
-									<button
-										onclick={() => trading.toggleStockTrading(!marketControl?.stock_enabled)}
-										class="relative inline-flex h-8 w-14 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)] focus:ring-offset-2"
-										class:bg-green-500={marketControl?.stock_enabled ?? true}
-										class:bg-gray-300={!(marketControl?.stock_enabled ?? true)}
-										role="switch"
-										aria-checked={marketControl?.stock_enabled ?? true}
-										aria-label="Toggle stock trading"
-									>
-										<span
-											class="pointer-events-none inline-block h-7 w-7 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out"
-											class:translate-x-6={marketControl?.stock_enabled ?? true}
-											class:translate-x-0={!(marketControl?.stock_enabled ?? true)}
-										></span>
-									</button>
-								</div>
+				<!-- Account Summary -->
+				<div class="border-b border-terminal-border p-3">
+					<div class="text-xs text-muted uppercase tracking-wide mb-2">Account</div>
+					{#if account}
+						<div class="space-y-1.5 text-sm">
+							<div class="flex justify-between">
+								<span class="text-muted">Equity</span>
+								<span class="tabular-nums">{formatCurrencyCompact(account.net_liquidation)}</span>
 							</div>
-
-							<!-- Forex Trading Toggle -->
-							<div class="rounded-lg bg-[var(--color-bg)] p-4">
-								<div class="flex items-center justify-between">
-									<div class="flex items-center gap-3">
-										<span class="flex h-10 w-10 items-center justify-center rounded-full bg-purple-100 text-xl dark:bg-purple-900">💱</span>
-										<div>
-											<h3 class="font-medium text-[var(--color-text)]">Forex Trading</h3>
-											<p class="text-sm text-[var(--color-text-muted)]">
-												{marketControl?.forex_enabled ? 'Active' : 'Disabled'}
-												{#if marketControl?.forex_reason}
-													- {marketControl.forex_reason}
-												{/if}
-											</p>
-										</div>
-									</div>
-									<button
-										onclick={() => trading.toggleForexTrading(!marketControl?.forex_enabled)}
-										class="relative inline-flex h-8 w-14 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)] focus:ring-offset-2"
-										class:bg-green-500={marketControl?.forex_enabled ?? true}
-										class:bg-gray-300={!(marketControl?.forex_enabled ?? true)}
-										role="switch"
-										aria-checked={marketControl?.forex_enabled ?? true}
-										aria-label="Toggle forex trading"
-									>
-										<span
-											class="pointer-events-none inline-block h-7 w-7 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out"
-											class:translate-x-6={marketControl?.forex_enabled ?? true}
-											class:translate-x-0={!(marketControl?.forex_enabled ?? true)}
-										></span>
-									</button>
-								</div>
+							<div class="flex justify-between">
+								<span class="text-muted">Available</span>
+								<span class="tabular-nums text-profit">{formatCurrencyCompact(account.available_funds)}</span>
+							</div>
+							<div class="flex justify-between">
+								<span class="text-muted">Buying Power</span>
+								<span class="tabular-nums">{formatCurrencyCompact(account.buying_power)}</span>
 							</div>
 						</div>
-					</div>
+					{:else}
+						<div class="text-muted text-sm">Loading...</div>
+					{/if}
+				</div>
 
-					<!-- Account Summary Card -->
-					<div class="rounded-xl bg-[var(--color-surface)] p-6 shadow-sm lg:col-span-2">
-						<h2 class="mb-4 text-lg font-semibold text-[var(--color-text)]">Account Summary</h2>
-						{#if account}
-							<div class="grid grid-cols-2 gap-4 md:grid-cols-4">
-								<div>
-									<p class="text-sm text-[var(--color-text-muted)]">Net Liquidation</p>
-									<p class="text-2xl font-bold text-[var(--color-text)]">
-										{formatCurrency(account.net_liquidation)}
-									</p>
-								</div>
-								<div>
-									<p class="text-sm text-[var(--color-text-muted)]">Available Funds</p>
-									<p class="text-2xl font-bold text-green-500">
-										{formatCurrency(account.available_funds)}
-									</p>
-								</div>
-								<div>
-									<p class="text-sm text-[var(--color-text-muted)]">Margin Used</p>
-									<p class="text-2xl font-bold text-[var(--color-text)]">
+				<!-- Margin Health -->
+				<div class="border-b border-terminal-border p-3">
+					<div class="text-xs text-muted uppercase tracking-wide mb-2">Margin Health</div>
+					{#if account}
+						<div class="space-y-2">
+							<div>
+								<div class="flex justify-between text-xs mb-1">
+									<span class="text-muted">Used</span>
+									<span class:text-profit={account.margin_pct_used < 50}
+										  class:text-warning={account.margin_pct_used >= 50 && account.margin_pct_used < 80}
+										  class:text-loss={account.margin_pct_used >= 80}>
 										{account.margin_pct_used.toFixed(1)}%
-									</p>
-									<div class="mt-1 h-2 overflow-hidden rounded-full bg-gray-200 dark:bg-gray-700">
-										<div
-											class="h-full transition-all"
-											class:bg-green-500={account.margin_pct_used < 50}
-											class:bg-yellow-500={account.margin_pct_used >= 50 && account.margin_pct_used < 80}
-											class:bg-red-500={account.margin_pct_used >= 80}
-											style="width: {Math.min(account.margin_pct_used, 100)}%"
-										></div>
-									</div>
+									</span>
 								</div>
-								<div>
-									<p class="text-sm text-[var(--color-text-muted)]">Cushion</p>
-									<p class="text-2xl font-bold" class:text-green-500={account.cushion > 0.3} class:text-yellow-500={account.cushion <= 0.3 && account.cushion > 0.15} class:text-red-500={account.cushion <= 0.15}>
-										{(account.cushion * 100).toFixed(1)}%
-									</p>
+								<div class="h-1 overflow-hidden rounded-full bg-terminal-hover">
+									<div class="h-full transition-all"
+										class:bg-profit={account.margin_pct_used < 50}
+										class:bg-warning={account.margin_pct_used >= 50 && account.margin_pct_used < 80}
+										class:bg-loss={account.margin_pct_used >= 80}
+										style="width: {Math.min(account.margin_pct_used, 100)}%"></div>
 								</div>
 							</div>
-
-							<!-- Additional account metrics -->
-							<div class="mt-4 grid grid-cols-2 gap-4 border-t border-[var(--color-border)] pt-4 md:grid-cols-4">
-								<div>
-									<p class="text-sm text-[var(--color-text-muted)]">Buying Power</p>
-									<p class="font-medium text-[var(--color-text)]">{formatCurrency(account.buying_power)}</p>
-								</div>
-								<div>
-									<p class="text-sm text-[var(--color-text-muted)]">Maintenance Margin</p>
-									<p class="font-medium text-[var(--color-text)]">{formatCurrency(account.maintenance_margin)}</p>
-								</div>
-								<div>
-									<p class="text-sm text-[var(--color-text-muted)]">Excess Liquidity</p>
-									<p class="font-medium text-[var(--color-text)]">{formatCurrency(account.excess_liquidity)}</p>
-								</div>
-								<div>
-									<p class="text-sm text-[var(--color-text-muted)]">SMA</p>
-									<p class="font-medium text-[var(--color-text)]">{formatCurrency(account.sma)}</p>
-								</div>
-							</div>
-						{:else}
-							<p class="text-[var(--color-text-muted)]">Waiting for account data...</p>
-						{/if}
-					</div>
-
-					<!-- Currency Balances Card -->
-					<div class="rounded-xl bg-[var(--color-surface)] p-6 shadow-sm">
-						<h2 class="mb-4 text-lg font-semibold text-[var(--color-text)]">Currency Balances</h2>
-						{#if currencies?.currencies}
-							<div class="space-y-3">
-								{#each Object.entries(currencies.currencies) as [currency, balance]}
-									<div class="flex items-center justify-between rounded-lg bg-[var(--color-bg)] p-3">
-										<div class="flex items-center gap-2">
-											<span class="text-lg font-bold text-[var(--color-text)]">{currency}</span>
-											{#if currency === currencies.base_currency}
-												<span class="rounded bg-blue-100 px-1.5 py-0.5 text-xs text-blue-800 dark:bg-blue-900 dark:text-blue-200">Base</span>
-											{/if}
-										</div>
-										<div class="text-right">
-											<p class="font-medium text-[var(--color-text)]">
-												{new Intl.NumberFormat('en-CA', { style: 'currency', currency }).format(balance.cash)}
-											</p>
-											{#if balance.settled_cash !== balance.cash}
-												<p class="text-xs text-[var(--color-text-muted)]">
-													Settled: {new Intl.NumberFormat('en-CA', { style: 'currency', currency }).format(balance.settled_cash)}
-												</p>
-											{/if}
-										</div>
-									</div>
-								{/each}
-							</div>
-						{:else}
-							<p class="text-[var(--color-text-muted)]">Waiting for currency data...</p>
-						{/if}
-					</div>
-
-					<!-- Capital Allocation Card -->
-					<div class="rounded-xl bg-[var(--color-surface)] p-6 shadow-sm lg:col-span-3">
-						<div class="flex items-center justify-between mb-4">
-							<h2 class="text-lg font-semibold text-[var(--color-text)]">Capital Allocation</h2>
-							{#if capital?.session}
-								<span class="rounded-full bg-blue-100 px-3 py-1 text-sm font-medium text-blue-800 dark:bg-blue-900 dark:text-blue-200">
-									Session: {capital.session}
+							<div class="flex justify-between text-sm">
+								<span class="text-muted">Cushion</span>
+								<span class:text-profit={account.cushion > 0.3}
+									  class:text-warning={account.cushion <= 0.3 && account.cushion > 0.15}
+									  class:text-loss={account.cushion <= 0.15}>
+									{(account.cushion * 100).toFixed(1)}%
 								</span>
-							{/if}
+							</div>
 						</div>
-						{#if capital}
-							<div class="grid grid-cols-1 gap-6 md:grid-cols-3">
-								<!-- Stock Budget -->
-								<div class="rounded-lg bg-[var(--color-bg)] p-4">
-									<div class="flex items-center justify-between mb-2">
-										<h3 class="font-medium text-[var(--color-text)]">Stocks</h3>
-										<span class="h-2 w-2 rounded-full" class:bg-green-500={capital.stock_enabled} class:bg-red-500={!capital.stock_enabled}></span>
-									</div>
-									<div class="space-y-2">
-										<div class="flex justify-between text-sm">
-											<span class="text-[var(--color-text-muted)]">Budget</span>
-											<span class="text-[var(--color-text)]">{formatCurrency(capital.stock_budget)}</span>
-										</div>
-										<div class="flex justify-between text-sm">
-											<span class="text-[var(--color-text-muted)]">Used</span>
-											<span class="text-[var(--color-text)]">{formatCurrency(capital.stock_used)}</span>
-										</div>
-										<div class="flex justify-between text-sm font-medium">
-											<span class="text-[var(--color-text-muted)]">Available</span>
-											<span class="text-green-500">{formatCurrency(capital.stock_available)}</span>
-										</div>
-										<div class="h-2 overflow-hidden rounded-full bg-gray-200 dark:bg-gray-700">
-											<div
-												class="h-full bg-blue-500"
-												style="width: {capital.stock_budget > 0 ? (capital.stock_used / capital.stock_budget) * 100 : 0}%"
-											></div>
-										</div>
-									</div>
-								</div>
+					{:else}
+						<div class="text-muted text-sm">Loading...</div>
+					{/if}
+				</div>
 
-								<!-- Forex Budget -->
-								<div class="rounded-lg bg-[var(--color-bg)] p-4">
-									<div class="flex items-center justify-between mb-2">
-										<h3 class="font-medium text-[var(--color-text)]">Forex</h3>
-										<span class="h-2 w-2 rounded-full" class:bg-green-500={capital.forex_enabled} class:bg-red-500={!capital.forex_enabled}></span>
-									</div>
-									<div class="space-y-2">
-										<div class="flex justify-between text-sm">
-											<span class="text-[var(--color-text-muted)]">Budget</span>
-											<span class="text-[var(--color-text)]">{formatCurrency(capital.forex_budget)}</span>
-										</div>
-										<div class="flex justify-between text-sm">
-											<span class="text-[var(--color-text-muted)]">Used</span>
-											<span class="text-[var(--color-text)]">{formatCurrency(capital.forex_used)}</span>
-										</div>
-										<div class="flex justify-between text-sm font-medium">
-											<span class="text-[var(--color-text-muted)]">Available</span>
-											<span class="text-green-500">{formatCurrency(capital.forex_available)}</span>
-										</div>
-										<div class="h-2 overflow-hidden rounded-full bg-gray-200 dark:bg-gray-700">
-											<div
-												class="h-full bg-purple-500"
-												style="width: {capital.forex_budget > 0 ? (capital.forex_used / capital.forex_budget) * 100 : 0}%"
-											></div>
-										</div>
-									</div>
+				<!-- Capital Allocation -->
+				<div class="border-b border-terminal-border p-3">
+					<div class="text-xs text-muted uppercase tracking-wide mb-2">Allocation</div>
+					{#if capital}
+						<div class="space-y-2">
+							<!-- Stock -->
+							<div>
+								<div class="flex justify-between text-xs mb-1">
+									<span class="flex items-center gap-1">
+										<span class="h-2 w-2 rounded-sm bg-info"></span>
+										Stock
+									</span>
+									<span class="tabular-nums">{formatCurrencyCompact(capital.stock_used)} / {formatCurrencyCompact(capital.stock_budget)}</span>
 								</div>
-
-								<!-- Reserve -->
-								<div class="rounded-lg bg-[var(--color-bg)] p-4">
-									<div class="flex items-center justify-between mb-2">
-										<h3 class="font-medium text-[var(--color-text)]">Reserve</h3>
-										<span class="text-xs text-[var(--color-text-muted)]">Emergency buffer</span>
-									</div>
-									<div class="flex items-center justify-center h-20">
-										<p class="text-3xl font-bold text-[var(--color-text)]">{formatCurrency(capital.reserve)}</p>
-									</div>
-									<p class="text-center text-xs text-[var(--color-text-muted)]">
-										Protected from allocation
-									</p>
+								<div class="h-1 overflow-hidden rounded-full bg-terminal-hover">
+									<div class="h-full bg-info" style="width: {capital.stock_budget > 0 ? (capital.stock_used / capital.stock_budget) * 100 : 0}%"></div>
 								</div>
 							</div>
-						{:else}
-							<p class="text-[var(--color-text-muted)]">Waiting for capital allocation data...</p>
-						{/if}
-					</div>
-
-					<!-- V7.5: Margin Protection Card -->
-					<div class="rounded-xl bg-[var(--color-surface)] p-6 shadow-sm lg:col-span-3">
-						<div class="flex items-center justify-between mb-4">
-							<div class="flex items-center gap-3">
-								<h2 class="text-lg font-semibold text-[var(--color-text)]">Margin Protection</h2>
-								<span class="text-sm text-[var(--color-text-muted)]">
-									Pre-market close automatic sell system
+							<!-- Forex -->
+							<div>
+								<div class="flex justify-between text-xs mb-1">
+									<span class="flex items-center gap-1">
+										<span class="h-2 w-2 rounded-sm bg-purple-500"></span>
+										Forex
+									</span>
+									<span class="tabular-nums">{formatCurrencyCompact(capital.forex_used)} / {formatCurrencyCompact(capital.forex_budget)}</span>
+								</div>
+								<div class="h-1 overflow-hidden rounded-full bg-terminal-hover">
+									<div class="h-full bg-purple-500" style="width: {capital.forex_budget > 0 ? (capital.forex_used / capital.forex_budget) * 100 : 0}%"></div>
+								</div>
+							</div>
+							<!-- Reserve -->
+							<div class="flex justify-between text-xs">
+								<span class="flex items-center gap-1">
+									<span class="h-2 w-2 rounded-sm bg-profit"></span>
+									Reserve
 								</span>
+								<span class="tabular-nums text-profit">{formatCurrencyCompact(capital.reserve)}</span>
 							</div>
+						</div>
+					{:else}
+						<div class="text-muted text-sm">Loading...</div>
+					{/if}
+				</div>
+
+				<!-- Currency Balances -->
+				{#if currencies?.currencies}
+					<div class="border-b border-terminal-border p-3">
+						<div class="text-xs text-muted uppercase tracking-wide mb-2">Currencies</div>
+						<div class="space-y-1 text-sm">
+							{#each Object.entries(currencies.currencies) as [currency, balance]}
+								<div class="flex justify-between">
+									<span class="text-muted">{currency}</span>
+									<span class="tabular-nums">{new Intl.NumberFormat('en-CA', { style: 'currency', currency, maximumFractionDigits: 0 }).format(balance.cash)}</span>
+								</div>
+							{/each}
+						</div>
+					</div>
+				{/if}
+
+				<!-- Trading Controls -->
+				<div class="p-3 mt-auto">
+					<div class="text-xs text-muted uppercase tracking-wide mb-2">Controls</div>
+					<div class="space-y-2">
+						<!-- Stock Toggle -->
+						<div class="flex items-center justify-between">
+							<span class="text-sm flex items-center gap-2">
+								<span class="h-2 w-2 rounded-full" class:bg-profit={marketControl?.stock_enabled} class:bg-loss={!marketControl?.stock_enabled}></span>
+								Stock
+							</span>
 							<button
-								onclick={() => trading.toggleMarginProtection(!marginConfig?.enabled)}
-								class="relative inline-flex h-8 w-14 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)] focus:ring-offset-2"
-								class:bg-green-500={marginConfig?.enabled ?? false}
-								class:bg-gray-300={!(marginConfig?.enabled ?? false)}
-								role="switch"
-								aria-checked={marginConfig?.enabled ?? false}
-								aria-label="Toggle margin protection"
-							>
-								<span
-									class="pointer-events-none inline-block h-7 w-7 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out"
-									class:translate-x-6={marginConfig?.enabled ?? false}
-									class:translate-x-0={!(marginConfig?.enabled ?? false)}
-								></span>
+								onclick={() => trading.toggleStockTrading(!marketControl?.stock_enabled)}
+								class="rounded px-2 py-0.5 text-xs font-medium transition-colors"
+								class:bg-profit-dim={marketControl?.stock_enabled}
+								class:text-profit={marketControl?.stock_enabled}
+								class:bg-terminal-card={!marketControl?.stock_enabled}
+								class:text-muted={!marketControl?.stock_enabled}>
+								{marketControl?.stock_enabled ? 'ON' : 'OFF'}
 							</button>
 						</div>
+						<!-- Forex Toggle -->
+						<div class="flex items-center justify-between">
+							<span class="text-sm flex items-center gap-2">
+								<span class="h-2 w-2 rounded-full" class:bg-profit={marketControl?.forex_enabled} class:bg-loss={!marketControl?.forex_enabled}></span>
+								Forex
+							</span>
+							<button
+								onclick={() => trading.toggleForexTrading(!marketControl?.forex_enabled)}
+								class="rounded px-2 py-0.5 text-xs font-medium transition-colors"
+								class:bg-profit-dim={marketControl?.forex_enabled}
+								class:text-profit={marketControl?.forex_enabled}
+								class:bg-terminal-card={!marketControl?.forex_enabled}
+								class:text-muted={!marketControl?.forex_enabled}>
+								{marketControl?.forex_enabled ? 'ON' : 'OFF'}
+							</button>
+						</div>
+						<!-- Emergency Stop -->
+						<button
+							onclick={() => { trading.toggleStockTrading(false); trading.toggleForexTrading(false); }}
+							class="w-full rounded bg-loss py-1.5 text-xs font-bold text-white uppercase tracking-wide hover:bg-red-600 transition-colors">
+							Emergency Stop
+						</button>
+					</div>
+				</div>
+			</aside>
 
-						{#if marginConfig}
-							<div class="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-4">
-								<!-- Config Summary -->
-								<div class="rounded-lg bg-[var(--color-bg)] p-4">
-									<h3 class="font-medium text-[var(--color-text)] mb-3">Configuration</h3>
-									<div class="space-y-2 text-sm">
-										<div class="flex justify-between">
-											<span class="text-[var(--color-text-muted)]">Target Cushion</span>
-											<span class="text-[var(--color-text)]">{(marginConfig.target_cushion_pct * 100).toFixed(0)}%</span>
-										</div>
-										<div class="flex justify-between">
-											<span class="text-[var(--color-text-muted)]">Min Cushion</span>
-											<span class="text-[var(--color-text)]">{(marginConfig.min_cushion_pct * 100).toFixed(0)}%</span>
-										</div>
-										<div class="flex justify-between">
-											<span class="text-[var(--color-text-muted)]">Check Start</span>
-											<span class="text-[var(--color-text)]">{marginConfig.check_start_time}</span>
-										</div>
-										<div class="flex justify-between">
-											<span class="text-[var(--color-text-muted)]">Aggressive Time</span>
-											<span class="text-[var(--color-text)]">{marginConfig.aggressive_time}</span>
-										</div>
-									</div>
-								</div>
-
-								<!-- Scoring Weights -->
-								<div class="rounded-lg bg-[var(--color-bg)] p-4 lg:col-span-2">
-									<div class="flex items-center justify-between mb-3">
-										<h3 class="font-medium text-[var(--color-text)]">Scoring Weights</h3>
-										{#if !editingWeights}
-											<button
-												onclick={() => editingWeights = true}
-												class="text-sm text-[var(--color-primary)] hover:underline"
-											>
-												Edit
-											</button>
-										{:else}
-											<div class="flex gap-2">
-												<button
-													onclick={saveWeights}
-													class="text-sm text-green-500 hover:underline"
-												>
-													Save
-												</button>
-												<button
-													onclick={() => editingWeights = false}
-													class="text-sm text-red-500 hover:underline"
-												>
-													Cancel
-												</button>
-											</div>
-										{/if}
-									</div>
-
-									{#if editingWeights}
-										<div class="space-y-3">
-											<div>
-												<div class="flex justify-between text-sm mb-1">
-													<span class="text-[var(--color-text-muted)]">ML Exit</span>
-													<span class="text-[var(--color-text)]">{(tempWeights.weight_ml_exit * 100).toFixed(0)}%</span>
-												</div>
-												<input type="range" min="0" max="100" step="5"
-													bind:value={tempWeights.weight_ml_exit}
-													oninput={(e) => tempWeights.weight_ml_exit = parseInt(e.currentTarget.value) / 100}
-													class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer dark:bg-gray-700"
-												/>
-											</div>
-											<div>
-												<div class="flex justify-between text-sm mb-1">
-													<span class="text-[var(--color-text-muted)]">P&L Negative</span>
-													<span class="text-[var(--color-text)]">{(tempWeights.weight_pnl_negative * 100).toFixed(0)}%</span>
-												</div>
-												<input type="range" min="0" max="100" step="5"
-													bind:value={tempWeights.weight_pnl_negative}
-													oninput={(e) => tempWeights.weight_pnl_negative = parseInt(e.currentTarget.value) / 100}
-													class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer dark:bg-gray-700"
-												/>
-											</div>
-											<div>
-												<div class="flex justify-between text-sm mb-1">
-													<span class="text-[var(--color-text-muted)]">Time Held</span>
-													<span class="text-[var(--color-text)]">{(tempWeights.weight_time_held * 100).toFixed(0)}%</span>
-												</div>
-												<input type="range" min="0" max="100" step="5"
-													bind:value={tempWeights.weight_time_held}
-													oninput={(e) => tempWeights.weight_time_held = parseInt(e.currentTarget.value) / 100}
-													class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer dark:bg-gray-700"
-												/>
-											</div>
-											<div>
-												<div class="flex justify-between text-sm mb-1">
-													<span class="text-[var(--color-text-muted)]">Stop Proximity</span>
-													<span class="text-[var(--color-text)]">{(tempWeights.weight_stop_proximity * 100).toFixed(0)}%</span>
-												</div>
-												<input type="range" min="0" max="100" step="5"
-													bind:value={tempWeights.weight_stop_proximity}
-													oninput={(e) => tempWeights.weight_stop_proximity = parseInt(e.currentTarget.value) / 100}
-													class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer dark:bg-gray-700"
-												/>
-											</div>
-											<div>
-												<div class="flex justify-between text-sm mb-1">
-													<span class="text-[var(--color-text-muted)]">Volume Decay</span>
-													<span class="text-[var(--color-text)]">{(tempWeights.weight_volume_decay * 100).toFixed(0)}%</span>
-												</div>
-												<input type="range" min="0" max="100" step="5"
-													bind:value={tempWeights.weight_volume_decay}
-													oninput={(e) => tempWeights.weight_volume_decay = parseInt(e.currentTarget.value) / 100}
-													class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer dark:bg-gray-700"
-												/>
-											</div>
-											<div class="pt-2 border-t border-[var(--color-border)]">
-												<div class="flex justify-between text-sm font-medium">
-													<span class="text-[var(--color-text-muted)]">Total</span>
-													<span class:text-green-500={Math.abs(getTotalWeight() - 1.0) < 0.01}
-														class:text-red-500={Math.abs(getTotalWeight() - 1.0) >= 0.01}>
-														{(getTotalWeight() * 100).toFixed(0)}%
-														{#if Math.abs(getTotalWeight() - 1.0) >= 0.01}
-															(must be 100%)
-														{/if}
-													</span>
-												</div>
-											</div>
-										</div>
-									{:else}
-										<div class="grid grid-cols-2 gap-2 text-sm">
-											<div class="flex justify-between">
-												<span class="text-[var(--color-text-muted)]">ML Exit</span>
-												<span class="text-[var(--color-text)]">{(marginConfig.weight_ml_exit * 100).toFixed(0)}%</span>
-											</div>
-											<div class="flex justify-between">
-												<span class="text-[var(--color-text-muted)]">P&L Negative</span>
-												<span class="text-[var(--color-text)]">{(marginConfig.weight_pnl_negative * 100).toFixed(0)}%</span>
-											</div>
-											<div class="flex justify-between">
-												<span class="text-[var(--color-text-muted)]">Time Held</span>
-												<span class="text-[var(--color-text)]">{(marginConfig.weight_time_held * 100).toFixed(0)}%</span>
-											</div>
-											<div class="flex justify-between">
-												<span class="text-[var(--color-text-muted)]">Stop Proximity</span>
-												<span class="text-[var(--color-text)]">{(marginConfig.weight_stop_proximity * 100).toFixed(0)}%</span>
-											</div>
-											<div class="flex justify-between">
-												<span class="text-[var(--color-text-muted)]">Volume Decay</span>
-												<span class="text-[var(--color-text)]">{(marginConfig.weight_volume_decay * 100).toFixed(0)}%</span>
-											</div>
-										</div>
-									{/if}
-								</div>
-
-								<!-- Max Positions Control -->
-								<div class="rounded-lg bg-[var(--color-bg)] p-4">
-									<h3 class="font-medium text-[var(--color-text)] mb-3">Max Positions</h3>
-									<div class="flex items-center gap-2">
-										<input type="number" min="1" max="100"
-											bind:value={tempMaxPositions}
-											class="w-20 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-[var(--color-text)] focus:border-[var(--color-primary)] focus:outline-none"
-										/>
-										<button
-											onclick={saveMaxPositions}
-											class="rounded-lg bg-[var(--color-primary)] px-3 py-2 text-sm font-medium text-white hover:opacity-90"
-										>
-											Update
-										</button>
-									</div>
-									<p class="mt-2 text-xs text-[var(--color-text-muted)]">
-										Current: {tradingConfig?.max_positions ?? 'N/A'}
-									</p>
+			<!-- ==================== CENTER PANEL (Main Trading View) ==================== -->
+			<main class="flex flex-1 flex-col overflow-hidden">
+				<!-- Metrics Bar -->
+				<div class="flex items-center justify-between border-b border-terminal-border bg-terminal-card px-4 py-2">
+					<div class="flex items-center gap-6">
+						{#if metrics}
+							<div class="text-center">
+								<div class="text-xs text-muted">Win Rate</div>
+								<div class="text-lg font-bold tabular-nums" class:text-profit={metrics.winRate >= 50} class:text-loss={metrics.winRate < 50}>
+									{metrics.winRate.toFixed(0)}%
 								</div>
 							</div>
+							<div class="text-center">
+								<div class="text-xs text-muted">Trades Today</div>
+								<div class="text-lg font-bold tabular-nums">{metrics.tradesToday}</div>
+							</div>
+							<div class="text-center">
+								<div class="text-xs text-muted">Open</div>
+								<div class="text-lg font-bold tabular-nums text-info">{metrics.positionsOpen}</div>
+							</div>
+						{/if}
+					</div>
 
-							<!-- Position Sell Scores -->
-							{#if marginScores && marginScores.positions.length > 0}
-								<div class="mt-6">
-									<h3 class="font-medium text-[var(--color-text)] mb-3">Position Sell Scores</h3>
+					<!-- View Tabs -->
+					<div class="flex gap-1">
+						<button
+							onclick={() => activeView = 'positions'}
+							class="rounded px-3 py-1 text-xs font-medium transition-colors hover:text-primary"
+							class:bg-terminal-panel={activeView === 'positions'}
+							class:text-primary={activeView === 'positions'}
+							class:text-muted={activeView !== 'positions'}>
+							Positions
+						</button>
+						<button
+							onclick={() => activeView = 'scanner'}
+							class="rounded px-3 py-1 text-xs font-medium transition-colors hover:text-primary"
+							class:bg-terminal-panel={activeView === 'scanner'}
+							class:text-primary={activeView === 'scanner'}
+							class:text-muted={activeView !== 'scanner'}>
+							Scanner
+						</button>
+						<button
+							onclick={() => activeView = 'history'}
+							class="rounded px-3 py-1 text-xs font-medium transition-colors hover:text-primary"
+							class:bg-terminal-panel={activeView === 'history'}
+							class:text-primary={activeView === 'history'}
+							class:text-muted={activeView !== 'history'}>
+							History
+						</button>
+					</div>
+				</div>
+
+				<!-- View Content -->
+				<div class="flex-1 overflow-auto p-3">
+					{#if activeView === 'positions'}
+						<!-- ==================== POSITIONS VIEW ==================== -->
+						<div class="space-y-3">
+							<!-- Open Positions Table -->
+							<div class="rounded border border-terminal-border bg-terminal-panel">
+								<div class="flex items-center justify-between border-b border-terminal-border px-3 py-2">
+									<h2 class="text-xs font-medium uppercase tracking-wide text-muted">Open Positions ({$trading.positions.length})</h2>
+								</div>
+								{#if $trading.positions.length > 0}
 									<div class="overflow-x-auto">
-										<table class="w-full text-sm">
-											<thead class="bg-[var(--color-bg)]">
+										<table class="w-full text-xs">
+											<thead class="bg-terminal-card">
 												<tr>
-													<th class="px-3 py-2 text-left text-[var(--color-text-muted)]">Symbol</th>
-													<th class="px-3 py-2 text-right text-[var(--color-text-muted)]">Score</th>
-													<th class="px-3 py-2 text-center text-[var(--color-text-muted)]">Action</th>
-													<th class="px-3 py-2 text-right text-[var(--color-text-muted)]">P&L %</th>
-													<th class="px-3 py-2 text-right text-[var(--color-text-muted)]">Days</th>
-													<th class="px-3 py-2 text-left text-[var(--color-text-muted)]">ML</th>
-													<th class="px-3 py-2 text-right text-[var(--color-text-muted)]">Value</th>
+													<th class="px-3 py-2 text-left font-medium text-muted">Symbol</th>
+													<th class="px-3 py-2 text-left font-medium text-muted">Type</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">Qty</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">Entry</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">Current</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">P&L</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">%</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">Held</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">ML</th>
 												</tr>
 											</thead>
-											<tbody class="divide-y divide-[var(--color-border)]">
-												{#each marginScores.positions as pos}
-													<tr class="hover:bg-[var(--color-bg)]">
-														<td class="px-3 py-2 font-medium text-[var(--color-text)]">{pos.symbol}</td>
+											<tbody class="divide-y divide-terminal-border">
+												{#each $trading.positions as pos}
+													<tr
+														class="hover:bg-terminal-hover cursor-pointer transition-colors"
+														onclick={() => (selectedPosition = pos)}
+														role="button"
+														tabindex="0"
+														onkeydown={(e) => e.key === 'Enter' && (selectedPosition = pos)}
+													>
+														<td class="px-3 py-2 font-medium">{pos.symbol}</td>
+														<td class="px-3 py-2">
+															<span class="rounded px-1.5 py-0.5 text-[10px] font-medium"
+																class:bg-info-dim={pos.asset_type === 'stock'}
+																class:text-info={pos.asset_type === 'stock'}
+																class:bg-purple-dim={pos.asset_type === 'forex'}
+																class:text-purple-400={pos.asset_type === 'forex'}>
+																{pos.asset_type.toUpperCase()}
+															</span>
+														</td>
+														<td class="px-3 py-2 text-right tabular-nums">
+															{pos.asset_type === 'forex' ? `$${pos.quantity.toFixed(0)}` : pos.quantity}
+														</td>
+														<td class="px-3 py-2 text-right tabular-nums text-muted">
+															${pos.entry_price.toFixed(pos.asset_type === 'forex' ? 5 : 2)}
+														</td>
+														<td class="px-3 py-2 text-right tabular-nums">
+															${pos.current_price.toFixed(pos.asset_type === 'forex' ? 5 : 2)}
+														</td>
+														<td class="px-3 py-2 text-right tabular-nums font-medium {getPnlColor(pos.unrealized_pnl)}">
+															{formatCurrency(pos.unrealized_pnl)}
+														</td>
+														<td class="px-3 py-2 text-right tabular-nums {getPnlColor(pos.pnl_percent)}">
+															{formatPercent(pos.pnl_percent)}
+														</td>
+														<td class="px-3 py-2 text-right tabular-nums text-muted">
+															{formatHeldTime(pos.entry_time)}
+														</td>
 														<td class="px-3 py-2 text-right">
-															<span class="rounded-full px-2 py-0.5 text-xs font-medium"
-																class:bg-red-100={pos.score >= 0.7}
-																class:text-red-800={pos.score >= 0.7}
-																class:bg-yellow-100={pos.score >= 0.5 && pos.score < 0.7}
-																class:text-yellow-800={pos.score >= 0.5 && pos.score < 0.7}
-																class:bg-green-100={pos.score < 0.5}
-																class:text-green-800={pos.score < 0.5}
-															>
+															<span class="rounded px-1.5 py-0.5 text-[10px] font-medium"
+																class:bg-profit-dim={(pos.ml_score || 0) > 0.7}
+																class:text-profit={(pos.ml_score || 0) > 0.7}
+																class:bg-warning-dim={(pos.ml_score || 0) > 0.5 && (pos.ml_score || 0) <= 0.7}
+																class:text-warning={(pos.ml_score || 0) > 0.5 && (pos.ml_score || 0) <= 0.7}
+																class:bg-terminal-card={(pos.ml_score || 0) <= 0.5}
+																class:text-muted={(pos.ml_score || 0) <= 0.5}>
+																{((pos.ml_score || 0) * 100).toFixed(0)}%
+															</span>
+														</td>
+													</tr>
+												{/each}
+											</tbody>
+										</table>
+									</div>
+								{:else}
+									<div class="p-6 text-center text-muted text-sm">No open positions</div>
+								{/if}
+							</div>
+
+							<!-- Closed Today - V7.47.2: Enriched with qty, prices, ML -->
+							<div class="rounded border border-terminal-border bg-terminal-panel">
+								<div class="flex items-center justify-between border-b border-terminal-border px-3 py-2">
+									<h2 class="text-xs font-medium uppercase tracking-wide text-muted">Closed Today ({$trading.closedToday.length})</h2>
+								</div>
+								{#if $trading.closedToday.length > 0}
+									<div class="divide-y divide-terminal-border max-h-96 overflow-y-auto">
+										{#each $trading.closedToday as trade, i}
+											<details class="group">
+												<summary class="flex items-center justify-between px-3 py-2 hover:bg-terminal-hover cursor-pointer list-none">
+													<div class="flex items-center gap-2">
+														<!-- Win/Loss indicator -->
+														<span class="w-2 h-2 rounded-full {trade.is_win || trade.pnl > 0 ? 'bg-profit' : 'bg-loss'}"></span>
+														<span class="font-medium">{trade.symbol}</span>
+														<span class="text-xs px-1.5 py-0.5 rounded {trade.asset_type === 'forex' ? 'bg-blue-500/20 text-blue-400' : 'bg-purple-500/20 text-purple-400'}">
+															{trade.asset_type || 'stock'}
+														</span>
+														<span class="text-xs text-muted">{trade.exit_reason}</span>
+														<span class="text-xs text-muted">({trade.duration_min}m)</span>
+													</div>
+													<div class="flex items-center gap-3">
+														<div class="text-right">
+															<span class="font-medium tabular-nums {getPnlColor(trade.pnl)}">{formatCurrency(trade.pnl)}</span>
+															<span class="text-xs ml-1 {getPnlColor(trade.pnl_pct)}">{formatPercent(trade.pnl_pct)}</span>
+														</div>
+														<span class="text-muted group-open:rotate-180 transition-transform">▼</span>
+													</div>
+												</summary>
+												<!-- Expanded details -->
+												<div class="px-3 py-2 bg-terminal-card/50 text-xs border-t border-terminal-border/50">
+													<div class="grid grid-cols-2 md:grid-cols-4 gap-2">
+														{#if trade.quantity}
+															<div>
+																<span class="text-muted">Qty:</span>
+																<span class="ml-1 font-medium">{trade.quantity.toLocaleString()}</span>
+															</div>
+														{/if}
+														{#if trade.entry_price}
+															<div>
+																<span class="text-muted">Entry:</span>
+																<span class="ml-1 font-medium tabular-nums">${trade.entry_price.toFixed(trade.asset_type === 'forex' ? 5 : 2)}</span>
+															</div>
+														{/if}
+														{#if trade.exit_price}
+															<div>
+																<span class="text-muted">Exit:</span>
+																<span class="ml-1 font-medium tabular-nums">${trade.exit_price.toFixed(trade.asset_type === 'forex' ? 5 : 2)}</span>
+															</div>
+														{/if}
+														{#if trade.ml_score !== undefined && trade.ml_score > 0}
+															<div>
+																<span class="text-muted">ML Score:</span>
+																<span class="ml-1 font-medium {trade.ml_score >= 0.7 ? 'text-profit' : trade.ml_score >= 0.5 ? 'text-warning' : 'text-muted'}">{(trade.ml_score * 100).toFixed(0)}%</span>
+															</div>
+														{/if}
+														{#if trade.exit_time}
+															<div>
+																<span class="text-muted">Closed:</span>
+																<span class="ml-1">{new Date(trade.exit_time).toLocaleTimeString()}</span>
+															</div>
+														{/if}
+													</div>
+													<!-- Chart button -->
+													<div class="mt-2 flex gap-2">
+														<a
+															href="https://www.tradingview.com/chart/?symbol={trade.asset_type === 'forex' ? 'FX:' + trade.symbol.replace('/', '') : trade.symbol}"
+															target="_blank"
+															class="inline-flex items-center gap-1 px-2 py-1 rounded bg-terminal-border hover:bg-terminal-hover text-xs"
+														>
+															📊 TradingView
+														</a>
+														<a
+															href="https://finviz.com/quote.ashx?t={trade.symbol}&p=d"
+															target="_blank"
+															class="inline-flex items-center gap-1 px-2 py-1 rounded bg-terminal-border hover:bg-terminal-hover text-xs {trade.asset_type === 'forex' ? 'hidden' : ''}"
+														>
+															📈 FinViz
+														</a>
+													</div>
+												</div>
+											</details>
+										{/each}
+									</div>
+								{:else}
+									<div class="p-4 text-center text-muted text-sm">No trades closed today</div>
+								{/if}
+							</div>
+
+							<!-- Margin Protection Scores (if available) -->
+							{#if marginScores && marginScores.positions.length > 0}
+								<div class="rounded border border-terminal-border bg-terminal-panel">
+									<div class="flex items-center justify-between border-b border-terminal-border px-3 py-2">
+										<h2 class="text-xs font-medium uppercase tracking-wide text-muted">Margin Protection Scores</h2>
+										<span class="text-xs" class:text-profit={marginConfig?.enabled} class:text-muted={!marginConfig?.enabled}>
+											{marginConfig?.enabled ? 'ACTIVE' : 'DISABLED'}
+										</span>
+									</div>
+									<div class="overflow-x-auto">
+										<table class="w-full text-xs">
+											<thead class="bg-terminal-card">
+												<tr>
+													<th class="px-3 py-2 text-left font-medium text-muted">Symbol</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">Score</th>
+													<th class="px-3 py-2 text-center font-medium text-muted">Action</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">P&L</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">Days</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">Value</th>
+												</tr>
+											</thead>
+											<tbody class="divide-y divide-terminal-border">
+												{#each marginScores.positions as pos}
+													<tr class="hover:bg-terminal-hover">
+														<td class="px-3 py-2 font-medium">{pos.symbol}</td>
+														<td class="px-3 py-2 text-right">
+															<span class="rounded px-1.5 py-0.5 text-[10px] font-medium"
+																class:bg-loss-dim={pos.score >= 0.7}
+																class:text-loss={pos.score >= 0.7}
+																class:bg-warning-dim={pos.score >= 0.5 && pos.score < 0.7}
+																class:text-warning={pos.score >= 0.5 && pos.score < 0.7}
+																class:bg-profit-dim={pos.score < 0.5}
+																class:text-profit={pos.score < 0.5}>
 																{(pos.score * 100).toFixed(0)}%
 															</span>
 														</td>
 														<td class="px-3 py-2 text-center">
-															<span class="text-xs font-medium"
-																class:text-red-500={pos.action === 'SELL_IMMEDIATE'}
-																class:text-yellow-500={pos.action === 'SELL_CANDIDATE'}
-																class:text-green-500={pos.action === 'HOLD'}
-															>
+															<span class="text-[10px] font-medium"
+																class:text-loss={pos.action === 'SELL_IMMEDIATE'}
+																class:text-warning={pos.action === 'SELL_CANDIDATE'}
+																class:text-profit={pos.action === 'HOLD'}>
 																{pos.action}
 															</span>
 														</td>
-														<td class="px-3 py-2 text-right {getPnlColor(pos.pnl_pct)}">
+														<td class="px-3 py-2 text-right tabular-nums {getPnlColor(pos.pnl_pct)}">
 															{formatPercent(pos.pnl_pct)}
 														</td>
-														<td class="px-3 py-2 text-right text-[var(--color-text)]">{pos.days_held}</td>
-														<td class="px-3 py-2 text-[var(--color-text-muted)]">
-															{pos.ml_action} ({(pos.ml_confidence * 100).toFixed(0)}%)
+														<td class="px-3 py-2 text-right tabular-nums text-muted">{pos.days_held}</td>
+														<td class="px-3 py-2 text-right tabular-nums">{formatCurrencyCompact(pos.position_value)}</td>
+													</tr>
+												{/each}
+											</tbody>
+										</table>
+									</div>
+								</div>
+							{/if}
+						</div>
+
+					{:else if activeView === 'scanner'}
+						<!-- ==================== SCANNER VIEW ==================== -->
+						<div class="space-y-3">
+							<!-- Pipeline Stats -->
+							{#if pipeline}
+								<div class="grid grid-cols-2 gap-3">
+									<!-- Stock Pipeline -->
+									<div class="rounded border border-terminal-border bg-terminal-panel p-3">
+										<div class="flex items-center gap-2 mb-3">
+											<span class="h-2 w-2 rounded-full bg-info"></span>
+											<h3 class="text-xs font-medium uppercase tracking-wide text-muted">Stock Pipeline</h3>
+										</div>
+										<div class="grid grid-cols-3 gap-2 text-center">
+											<div>
+												<div class="text-lg font-bold tabular-nums">{pipeline.stock.scanned}</div>
+												<div class="text-[10px] text-muted">Scanned</div>
+											</div>
+											<div>
+												<div class="text-lg font-bold tabular-nums text-info">{pipeline.stock.passed_ml}</div>
+												<div class="text-[10px] text-muted">ML Pass</div>
+											</div>
+											<div>
+												<div class="text-lg font-bold tabular-nums text-profit">{pipeline.stock.entered}</div>
+												<div class="text-[10px] text-muted">Entered</div>
+											</div>
+										</div>
+									</div>
+									<!-- Forex Pipeline -->
+									<div class="rounded border border-terminal-border bg-terminal-panel p-3">
+										<div class="flex items-center gap-2 mb-3">
+											<span class="h-2 w-2 rounded-full bg-purple-500"></span>
+											<h3 class="text-xs font-medium uppercase tracking-wide text-muted">Forex Pipeline</h3>
+										</div>
+										<div class="grid grid-cols-3 gap-2 text-center">
+											<div>
+												<div class="text-lg font-bold tabular-nums">{pipeline.forex.pairs_monitored}</div>
+												<div class="text-[10px] text-muted">Monitored</div>
+											</div>
+											<div>
+												<div class="text-lg font-bold tabular-nums text-purple-400">{pipeline.forex.passed_ml}</div>
+												<div class="text-[10px] text-muted">ML Pass</div>
+											</div>
+											<div>
+												<div class="text-lg font-bold tabular-nums text-profit">{pipeline.forex.entered}</div>
+												<div class="text-[10px] text-muted">Entered</div>
+											</div>
+										</div>
+									</div>
+								</div>
+							{/if}
+
+							<!-- Top Candidates -->
+							<div class="rounded border border-terminal-border bg-terminal-panel">
+								<div class="border-b border-terminal-border px-3 py-2">
+									<h2 class="text-xs font-medium uppercase tracking-wide text-muted">Top Candidates ({recommendations.length})</h2>
+								</div>
+								{#if recommendations.length > 0}
+									<div class="grid gap-2 p-3 md:grid-cols-2">
+										{#each recommendations as candidate}
+											<div class="rounded border border-terminal-border bg-terminal-card p-3">
+												<div class="flex items-center justify-between">
+													<span class="font-medium">{candidate.symbol}</span>
+													<span class="rounded px-1.5 py-0.5 text-[10px] font-medium"
+														class:bg-profit-dim={candidate.ml_score > 0.8}
+														class:text-profit={candidate.ml_score > 0.8}
+														class:bg-warning-dim={candidate.ml_score <= 0.8}
+														class:text-warning={candidate.ml_score <= 0.8}>
+														ML: {(candidate.ml_score * 100).toFixed(0)}%
+													</span>
+												</div>
+												<div class="mt-1 text-xs text-muted">
+													{candidate.pattern}
+													{#if candidate.volume_ratio}
+														<span class="ml-1">Vol x{candidate.volume_ratio.toFixed(1)}</span>
+													{/if}
+												</div>
+												{#if candidate.reason_skip}
+													<div class="mt-1 text-[10px] text-warning">Skip: {candidate.reason_skip}</div>
+												{:else}
+													<div class="mt-1 text-[10px] text-profit">Ready</div>
+												{/if}
+											</div>
+										{/each}
+									</div>
+								{:else}
+									<div class="p-6 text-center text-muted text-sm">No candidates</div>
+								{/if}
+							</div>
+						</div>
+
+					{:else if activeView === 'history'}
+						<!-- ==================== HISTORY VIEW ==================== -->
+						<div class="space-y-3">
+							<!-- Stats Summary -->
+							<div class="grid grid-cols-4 gap-3">
+								{#if allTimeStats}
+									<div class="rounded border border-terminal-border bg-terminal-panel p-3 text-center">
+										<div class="text-[10px] text-muted uppercase">Total Trades</div>
+										<div class="text-xl font-bold tabular-nums">{allTimeStats.total_trades}</div>
+									</div>
+									<div class="rounded border border-terminal-border bg-terminal-panel p-3 text-center">
+										<div class="text-[10px] text-muted uppercase">Win Rate</div>
+										<div class="text-xl font-bold tabular-nums" class:text-profit={allTimeStats.win_rate >= 50} class:text-loss={allTimeStats.win_rate < 50}>
+											{allTimeStats.win_rate.toFixed(1)}%
+										</div>
+									</div>
+									<div class="rounded border border-terminal-border bg-terminal-panel p-3 text-center">
+										<div class="text-[10px] text-muted uppercase">Total P&L</div>
+										<div class="text-xl font-bold tabular-nums {getPnlColor(allTimeStats.total_pnl)}">
+											{formatCurrencyCompact(allTimeStats.total_pnl)}
+										</div>
+									</div>
+									<div class="rounded border border-terminal-border bg-terminal-panel p-3 text-center">
+										<div class="text-[10px] text-muted uppercase">Profit Factor</div>
+										<div class="text-xl font-bold tabular-nums" class:text-profit={allTimeStats.profit_factor >= 1} class:text-loss={allTimeStats.profit_factor < 1}>
+											{allTimeStats.profit_factor.toFixed(2)}
+										</div>
+									</div>
+								{/if}
+							</div>
+
+							<!-- Charts -->
+							<div class="grid grid-cols-2 gap-3">
+								<div class="rounded border border-terminal-border bg-terminal-panel p-3">
+									<h3 class="text-xs font-medium uppercase tracking-wide text-muted mb-2">Daily P&L</h3>
+									<HistoryChart
+										dailyStats={historySummary?.daily_stats || []}
+										mlMetrics={historySummary?.ml_metrics || []}
+										chartType="pnl"
+									/>
+								</div>
+								<div class="rounded border border-terminal-border bg-terminal-panel p-3">
+									<h3 class="text-xs font-medium uppercase tracking-wide text-muted mb-2">Win Rate Trend</h3>
+									<HistoryChart
+										dailyStats={historySummary?.daily_stats || []}
+										mlMetrics={historySummary?.ml_metrics || []}
+										chartType="winrate"
+									/>
+								</div>
+							</div>
+
+							<!-- Daily Stats Table -->
+							{#if historySummary?.daily_stats && historySummary.daily_stats.length > 0}
+								<div class="rounded border border-terminal-border bg-terminal-panel">
+									<div class="border-b border-terminal-border px-3 py-2">
+										<h2 class="text-xs font-medium uppercase tracking-wide text-muted">Daily Breakdown</h2>
+									</div>
+									<div class="overflow-x-auto">
+										<table class="w-full text-xs">
+											<thead class="bg-terminal-card">
+												<tr>
+													<th class="px-3 py-2 text-left font-medium text-muted">Date</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">Trades</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">W/L</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">Win Rate</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">P&L</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">PF</th>
+												</tr>
+											</thead>
+											<tbody class="divide-y divide-terminal-border">
+												{#each historySummary.daily_stats as day}
+													<tr class="hover:bg-terminal-hover">
+														<td class="px-3 py-2 font-medium">{day.date}</td>
+														<td class="px-3 py-2 text-right tabular-nums">{day.trades}</td>
+														<td class="px-3 py-2 text-right">
+															<span class="text-profit">{day.wins}</span>/<span class="text-loss">{day.losses}</span>
 														</td>
-														<td class="px-3 py-2 text-right text-[var(--color-text)]">
-															{formatCurrency(pos.position_value)}
+														<td class="px-3 py-2 text-right tabular-nums" class:text-profit={day.win_rate >= 50} class:text-loss={day.win_rate < 50}>
+															{day.win_rate.toFixed(1)}%
+														</td>
+														<td class="px-3 py-2 text-right tabular-nums font-medium {getPnlColor(day.realized_pnl)}">
+															{formatCurrency(day.realized_pnl)}
+														</td>
+														<td class="px-3 py-2 text-right tabular-nums" class:text-profit={day.profit_factor >= 1} class:text-loss={day.profit_factor < 1}>
+															{day.profit_factor.toFixed(2)}
 														</td>
 													</tr>
 												{/each}
@@ -971,298 +1059,471 @@
 									</div>
 								</div>
 							{/if}
-						{:else}
-							<p class="text-[var(--color-text-muted)]">Waiting for margin protection config...</p>
+						</div>
+					{/if}
+				</div>
+			</main>
+
+			<!-- ==================== RIGHT PANEL (System Health & Services) ==================== -->
+			<aside class="flex w-52 flex-col border-l border-terminal-border bg-terminal-panel">
+				<!-- IBKR Connection -->
+				<div class="border-b border-terminal-border p-3">
+					<div class="text-xs text-muted uppercase tracking-wide mb-2">IBKR</div>
+					{#if ibkr}
+						<div class="space-y-1.5 text-sm">
+							<div class="flex justify-between">
+								<span class="text-muted">Status</span>
+								<span class="flex items-center gap-1">
+									<span class="h-2 w-2 rounded-full {getStatusColor(ibkr.status)}"></span>
+									<span class:text-profit={ibkr.status === 'CONNECTED'} class:text-loss={ibkr.status !== 'CONNECTED'}>
+										{ibkr.status}
+									</span>
+								</span>
+							</div>
+							<div class="flex justify-between">
+								<span class="text-muted">Latency</span>
+								<span class={getLatencyColor(ibkr.latency_ms)}>{ibkr.latency_ms}ms</span>
+							</div>
+							<div class="flex justify-between">
+								<span class="text-muted">Account</span>
+								<span class="text-xs tabular-nums">{ibkr.account}</span>
+							</div>
+						</div>
+					{:else}
+						<div class="text-muted text-sm">Loading...</div>
+					{/if}
+				</div>
+
+				<!-- Services Health -->
+				<div class="border-b border-terminal-border p-3">
+					<button
+						onclick={() => servicesCollapsed = !servicesCollapsed}
+						class="flex items-center justify-between w-full text-xs text-muted uppercase tracking-wide mb-2 hover:text-primary">
+						<span>Services ({health.healthy}/{health.total})</span>
+						<svg class="h-3 w-3 transition-transform" class:rotate-180={!servicesCollapsed} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+						</svg>
+					</button>
+					{#if !servicesCollapsed}
+						<div class="space-y-1">
+							{#each health.services.slice(0, 8) as service}
+								<div class="flex items-center justify-between text-xs">
+									<span class="text-muted truncate" title={service.name}>{service.name}</span>
+									<span class="h-2 w-2 rounded-full {getStatusColor(service.status)}"></span>
+								</div>
+							{/each}
+							{#if health.services.length > 8}
+								<div class="text-[10px] text-muted">+{health.services.length - 8} more</div>
+							{/if}
+						</div>
+					{/if}
+				</div>
+
+				<!-- ML Models -->
+				<div class="border-b border-terminal-border p-3">
+					<div class="text-xs text-muted uppercase tracking-wide mb-2">ML Models</div>
+					<div class="space-y-1.5 text-sm">
+						{#if $trading.mlEntry}
+							<div class="flex justify-between">
+								<span class="text-muted">Entry</span>
+								<span class="text-profit">{($trading.mlEntry.accuracy_7d * 100).toFixed(0)}%</span>
+							</div>
+						{/if}
+						{#if $trading.mlExit}
+							<div class="flex justify-between">
+								<span class="text-muted">Exit</span>
+								<span class="text-profit">{($trading.mlExit.hit_rate_7d * 100).toFixed(0)}%</span>
+							</div>
 						{/if}
 					</div>
 				</div>
 
-			{:else if activeTab === 'services'}
-				<!-- Services Tab -->
-				<div class="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
-					{#each health.services as service}
-						<div class="rounded-xl bg-[var(--color-surface)] p-4 shadow-sm">
-							<div class="flex items-center justify-between">
-								<h3 class="font-medium text-[var(--color-text)]">{service.name}</h3>
-								<span class="h-3 w-3 rounded-full {getStatusColor(service.status)}"></span>
+				<!-- Quick Stats -->
+				<div class="p-3 mt-auto">
+					<div class="text-xs text-muted uppercase tracking-wide mb-2">Session</div>
+					<div class="space-y-1 text-sm">
+						{#if capital?.session}
+							<div class="flex justify-between">
+								<span class="text-muted">Market</span>
+								<span class="text-info">{capital.session}</span>
 							</div>
-							<p class="mt-1 text-sm text-[var(--color-text-muted)]">
-								{service.status || 'Unknown'}
-							</p>
-						</div>
+						{/if}
+						{#if tradingConfig}
+							<div class="flex justify-between">
+								<span class="text-muted">Max Pos</span>
+								<span>{tradingConfig.max_positions}</span>
+							</div>
+						{/if}
+					</div>
+				</div>
+			</aside>
+		</div>
+	</div>
+
+	<!-- ==================== SETTINGS MODAL ==================== -->
+	{#if showSettingsModal}
+		<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onclick={() => showSettingsModal = false}>
+			<div class="w-full max-w-2xl rounded-lg border border-terminal-border bg-terminal-panel shadow-2xl" onclick={(e) => e.stopPropagation()}>
+				<!-- Modal Header -->
+				<div class="flex items-center justify-between border-b border-terminal-border px-4 py-3">
+					<h2 class="text-sm font-semibold">Settings</h2>
+					<button onclick={() => showSettingsModal = false} class="text-muted hover:text-primary">
+						<svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+						</svg>
+					</button>
+				</div>
+
+				<!-- Modal Tabs -->
+				<div class="flex border-b border-terminal-border">
+					{#each [
+						{ id: 'limits', label: 'Position Limits' },
+						{ id: 'budget', label: 'Budget' },
+						{ id: 'margin', label: 'Margin Protection' },
+						{ id: 'services', label: 'Services' }
+					] as tab}
+						<button
+							onclick={() => settingsTab = tab.id as typeof settingsTab}
+							class="px-4 py-2 text-xs font-medium border-b-2 transition-colors"
+							class:border-info={settingsTab === tab.id}
+							class:text-info={settingsTab === tab.id}
+							class:border-transparent={settingsTab !== tab.id}
+							class:text-muted={settingsTab !== tab.id}>
+							{tab.label}
+						</button>
 					{/each}
 				</div>
 
-				<!-- Detailed Services -->
-				<div class="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-2">
-					<!-- ML Entry -->
-					{#if $trading.mlEntry}
-						<div class="rounded-xl bg-[var(--color-surface)] p-6 shadow-sm">
-							<h3 class="mb-4 font-semibold text-[var(--color-text)]">ML Entry Predictor</h3>
-							<div class="grid grid-cols-2 gap-4">
-								<div>
-									<p class="text-sm text-[var(--color-text-muted)]">Predictions (1h)</p>
-									<p class="text-xl font-bold text-[var(--color-text)]">
-										{$trading.mlEntry.predictions_1h}
-									</p>
-								</div>
-								<div>
-									<p class="text-sm text-[var(--color-text-muted)]">Accuracy (7d)</p>
-									<p class="text-xl font-bold text-[var(--color-text)]">
-										{($trading.mlEntry.accuracy_7d * 100).toFixed(1)}%
-									</p>
-								</div>
-								<div>
-									<p class="text-sm text-[var(--color-text-muted)]">Avg Latency</p>
-									<p class="text-xl font-bold text-[var(--color-text)]">
-										{$trading.mlEntry.avg_latency_ms.toFixed(0)}ms
-									</p>
-								</div>
-								<div>
-									<p class="text-sm text-[var(--color-text-muted)]">Cache Hit Rate</p>
-									<p class="text-xl font-bold text-[var(--color-text)]">
-										{($trading.mlEntry.cache_hit_rate * 100).toFixed(0)}%
-									</p>
+				<!-- Modal Content -->
+				<div class="p-4 max-h-[60vh] overflow-y-auto">
+					{#if settingsTab === 'limits'}
+						<!-- Position Limits -->
+						<div class="space-y-4">
+							<div>
+								<label class="block text-xs text-muted mb-1">Stock Max Position ($)</label>
+								<div class="flex items-center gap-2">
+									<input
+										type="number"
+										bind:value={tempStockMaxValue}
+										min="100"
+										max="50000"
+										step="100"
+										class="flex-1 rounded border border-terminal-border bg-terminal-card text-primary px-3 py-2 text-sm focus:border-info focus:outline-none"
+									/>
+									<span class="text-xs text-muted">Current: {formatCurrency(positionLimits?.stock?.max_position_value ?? 5000)}</span>
 								</div>
 							</div>
-						</div>
-					{/if}
-
-					<!-- ML Exit -->
-					{#if $trading.mlExit}
-						<div class="rounded-xl bg-[var(--color-surface)] p-6 shadow-sm">
-							<h3 class="mb-4 font-semibold text-[var(--color-text)]">ML Exit Predictor</h3>
-							<div class="grid grid-cols-2 gap-4">
-								<div>
-									<p class="text-sm text-[var(--color-text-muted)]">Decisions (1h)</p>
-									<p class="text-xl font-bold text-[var(--color-text)]">
-										{$trading.mlExit.decisions_1h}
-									</p>
-								</div>
-								<div>
-									<p class="text-sm text-[var(--color-text-muted)]">Hit Rate (7d)</p>
-									<p class="text-xl font-bold text-[var(--color-text)]">
-										{($trading.mlExit.hit_rate_7d * 100).toFixed(1)}%
-									</p>
-								</div>
-								<div>
-									<p class="text-sm text-[var(--color-text-muted)]">Avg Latency</p>
-									<p class="text-xl font-bold text-[var(--color-text)]">
-										{$trading.mlExit.avg_latency_ms.toFixed(0)}ms
-									</p>
-								</div>
-								<div>
-									<p class="text-sm text-[var(--color-text-muted)]">Model Loaded</p>
-									<p class="text-xl font-bold text-[var(--color-text)]">
-										{$trading.mlExit.model_loaded ? 'Yes' : 'No'}
-									</p>
+							<div>
+								<label class="block text-xs text-muted mb-1">Forex Max Position ($)</label>
+								<div class="flex items-center gap-2">
+									<input
+										type="number"
+										bind:value={tempForexMaxValue}
+										min="100"
+										max="100000"
+										step="100"
+										class="flex-1 rounded border border-terminal-border bg-terminal-card text-primary px-3 py-2 text-sm focus:border-info focus:outline-none"
+									/>
+									<span class="text-xs text-muted">Current: {formatCurrency(positionLimits?.forex?.max_position_value ?? 5000)}</span>
 								</div>
 							</div>
+							<div>
+								<label class="block text-xs text-muted mb-1">Max Concurrent Positions</label>
+								<div class="flex items-center gap-2">
+									<input
+										type="number"
+										bind:value={tempMaxPositions}
+										min="1"
+										max="100"
+										class="w-24 rounded border border-terminal-border bg-terminal-card text-primary px-3 py-2 text-sm focus:border-info focus:outline-none"
+									/>
+									<span class="text-xs text-muted">Current: {tradingConfig?.max_positions ?? 'N/A'}</span>
+								</div>
+							</div>
+							<div class="flex gap-2">
+								<button
+									onclick={savePositionLimits}
+									class="rounded bg-info px-4 py-2 text-xs font-medium text-white hover:opacity-90">
+									Save Position Limits
+								</button>
+								<button
+									onclick={saveMaxPositions}
+									class="rounded bg-info px-4 py-2 text-xs font-medium text-white hover:opacity-90">
+									Save Max Positions
+								</button>
+							</div>
 						</div>
-					{/if}
-				</div>
 
-			{:else if activeTab === 'positions'}
-				<!-- Positions Tab -->
-				<div class="rounded-xl bg-[var(--color-surface)] shadow-sm">
-					<div class="border-b border-[var(--color-border)] p-4">
-						<h2 class="text-lg font-semibold text-[var(--color-text)]">Open Positions</h2>
-					</div>
-					{#if $trading.positions.length > 0}
-						<div class="overflow-x-auto">
-							<table class="w-full">
-								<thead class="bg-[var(--color-bg)]">
-									<tr>
-										<th class="px-4 py-3 text-left text-sm font-medium text-[var(--color-text-muted)]">Symbol</th>
-										<th class="px-4 py-3 text-left text-sm font-medium text-[var(--color-text-muted)]">Type</th>
-										<th class="px-4 py-3 text-right text-sm font-medium text-[var(--color-text-muted)]">Qty</th>
-										<th class="px-4 py-3 text-right text-sm font-medium text-[var(--color-text-muted)]">Entry</th>
-										<th class="px-4 py-3 text-right text-sm font-medium text-[var(--color-text-muted)]">Current</th>
-										<th class="px-4 py-3 text-right text-sm font-medium text-[var(--color-text-muted)]">P&L</th>
-										<th class="px-4 py-3 text-right text-sm font-medium text-[var(--color-text-muted)]">Score</th>
-									</tr>
-								</thead>
-								<tbody class="divide-y divide-[var(--color-border)]">
-									{#each $trading.positions as pos}
-										<tr class="hover:bg-[var(--color-bg)]">
-											<td class="px-4 py-3 font-medium text-[var(--color-text)]">{pos.symbol}</td>
-											<td class="px-4 py-3">
-												<span
-													class="rounded px-2 py-0.5 text-xs font-medium"
-													class:bg-blue-100={pos.asset_type === 'stock'}
-													class:text-blue-800={pos.asset_type === 'stock'}
-													class:bg-purple-100={pos.asset_type === 'forex'}
-													class:text-purple-800={pos.asset_type === 'forex'}
-												>
-													{pos.asset_type.toUpperCase()}
-												</span>
-											</td>
-											<td class="px-4 py-3 text-right text-[var(--color-text)]">{pos.quantity}</td>
-											<td class="px-4 py-3 text-right text-[var(--color-text)]">${pos.entry_price.toFixed(2)}</td>
-											<td class="px-4 py-3 text-right text-[var(--color-text)]">${pos.current_price.toFixed(2)}</td>
-											<td class="px-4 py-3 text-right font-medium {getPnlColor(pos.unrealized_pnl)}">
-												{formatCurrency(pos.unrealized_pnl)}
-												<span class="text-xs">({formatPercent(pos.pnl_percent)})</span>
-											</td>
-											<td class="px-4 py-3 text-right">
-												<span
-													class="rounded-full px-2 py-0.5 text-xs font-medium"
-													class:bg-green-100={pos.score > 0.7}
-													class:text-green-800={pos.score > 0.7}
-													class:bg-yellow-100={pos.score > 0.5 && pos.score <= 0.7}
-													class:text-yellow-800={pos.score > 0.5 && pos.score <= 0.7}
-													class:bg-gray-100={pos.score <= 0.5}
-													class:text-gray-800={pos.score <= 0.5}
-												>
-													{(pos.score * 100).toFixed(0)}%
-												</span>
-											</td>
-										</tr>
-									{/each}
-								</tbody>
-							</table>
+					{:else if settingsTab === 'budget'}
+						<!-- Budget Allocation -->
+						<div class="space-y-4">
+							<div>
+								<label class="block text-xs text-muted mb-1">Stock Budget: {tempStockBudgetPct}%</label>
+								<input
+									type="range"
+									bind:value={tempStockBudgetPct}
+									min="0"
+									max="100"
+									step="5"
+									class="w-full h-2 bg-terminal-card rounded-lg appearance-none cursor-pointer"
+								/>
+							</div>
+							<div>
+								<label class="block text-xs text-muted mb-1">Forex Budget: {tempForexBudgetPct}%</label>
+								<input
+									type="range"
+									bind:value={tempForexBudgetPct}
+									min="0"
+									max="100"
+									step="5"
+									class="w-full h-2 bg-terminal-card rounded-lg appearance-none cursor-pointer"
+								/>
+							</div>
+							<div class="flex items-center justify-between">
+								<span class="text-sm">Reserve: {100 - tempStockBudgetPct - tempForexBudgetPct}%</span>
+								<label class="flex items-center gap-2">
+									<span class="text-xs text-muted">Enforce Limits</span>
+									<button
+										onclick={() => tempEnforceBudgetLimits = !tempEnforceBudgetLimits}
+										class="relative h-5 w-9 rounded-full transition-colors"
+										class:bg-profit={tempEnforceBudgetLimits}
+										class:bg-terminal-card={!tempEnforceBudgetLimits}>
+										<span
+											class="absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform"
+											class:left-0.5={!tempEnforceBudgetLimits}
+											class:left-4={tempEnforceBudgetLimits}></span>
+									</button>
+								</label>
+							</div>
+							<!-- Visual breakdown -->
+							<div class="h-3 overflow-hidden rounded-full bg-terminal-card flex">
+								<div class="bg-info" style="width: {tempStockBudgetPct}%"></div>
+								<div class="bg-purple-500" style="width: {tempForexBudgetPct}%"></div>
+								<div class="bg-profit" style="width: {100 - tempStockBudgetPct - tempForexBudgetPct}%"></div>
+							</div>
+							<div class="flex justify-between text-xs text-muted">
+								<span>Stock {tempStockBudgetPct}%</span>
+								<span>Forex {tempForexBudgetPct}%</span>
+								<span>Reserve {100 - tempStockBudgetPct - tempForexBudgetPct}%</span>
+							</div>
+							{#if tempStockBudgetPct + tempForexBudgetPct > 100}
+								<div class="text-xs text-loss">Total exceeds 100%!</div>
+							{/if}
+							<button
+								onclick={saveBudgetAllocation}
+								disabled={tempStockBudgetPct + tempForexBudgetPct > 100}
+								class="rounded bg-info px-4 py-2 text-xs font-medium text-white hover:opacity-90 disabled:opacity-50">
+								Save Budget
+							</button>
 						</div>
-					{:else}
-						<div class="p-8 text-center text-[var(--color-text-muted)]">
-							No open positions
-						</div>
-					{/if}
-				</div>
 
-				<!-- Closed Today -->
-				<div class="mt-6 rounded-xl bg-[var(--color-surface)] shadow-sm">
-					<div class="border-b border-[var(--color-border)] p-4">
-						<h2 class="text-lg font-semibold text-[var(--color-text)]">Closed Today</h2>
-					</div>
-					{#if $trading.closedToday.length > 0}
-						<div class="divide-y divide-[var(--color-border)]">
-							{#each $trading.closedToday as trade}
-								<div class="flex items-center justify-between p-4">
-									<div>
-										<p class="font-medium text-[var(--color-text)]">{trade.symbol}</p>
-										<p class="text-sm text-[var(--color-text-muted)]">
-											{trade.exit_reason} - {trade.duration_min}min
-										</p>
+					{:else if settingsTab === 'margin'}
+						<!-- Margin Protection -->
+						<div class="space-y-4">
+							<div class="flex items-center justify-between">
+								<span class="text-sm">Margin Protection</span>
+								<button
+									onclick={() => trading.toggleMarginProtection(!marginConfig?.enabled)}
+									class="relative h-6 w-11 rounded-full transition-colors"
+									class:bg-profit={marginConfig?.enabled}
+									class:bg-terminal-card={!marginConfig?.enabled}>
+									<span
+										class="absolute top-0.5 h-5 w-5 rounded-full bg-white transition-transform"
+										class:left-0.5={!marginConfig?.enabled}
+										class:left-5={marginConfig?.enabled}></span>
+								</button>
+							</div>
+
+							<div>
+								<label class="block text-xs text-muted mb-1">Min Cushion for Entry (%)</label>
+								<div class="flex items-center gap-2">
+									<input
+										type="number"
+										bind:value={tempMinCushion}
+										min="1"
+										max="50"
+										class="w-20 rounded border border-terminal-border bg-terminal-card text-primary px-3 py-2 text-sm focus:border-info focus:outline-none"
+									/>
+									<button
+										onclick={saveMinCushion}
+										class="rounded bg-info px-3 py-2 text-xs font-medium text-white hover:opacity-90">
+										Set
+									</button>
+								</div>
+							</div>
+
+							{#if marginConfig}
+								<div class="text-xs text-muted space-y-1">
+									<div>Target Cushion: {(marginConfig.target_cushion_pct * 100).toFixed(0)}%</div>
+									<div>Check Start: {marginConfig.check_start_time}</div>
+									<div>Aggressive Time: {marginConfig.aggressive_time}</div>
+								</div>
+							{/if}
+
+							<!-- Weights -->
+							<div class="border-t border-terminal-border pt-4">
+								<div class="flex items-center justify-between mb-2">
+									<span class="text-xs text-muted uppercase">Scoring Weights</span>
+									{#if !editingWeights}
+										<button onclick={() => editingWeights = true} class="text-xs text-info hover:underline">Edit</button>
+									{:else}
+										<div class="flex gap-2">
+											<button onclick={saveWeights} class="text-xs text-profit hover:underline">Save</button>
+											<button onclick={() => editingWeights = false} class="text-xs text-loss hover:underline">Cancel</button>
+										</div>
+									{/if}
+								</div>
+								{#if editingWeights}
+									<div class="space-y-2">
+										{#each [
+											{ key: 'weight_ml_exit', label: 'ML Exit' },
+											{ key: 'weight_pnl_negative', label: 'P&L Negative' },
+											{ key: 'weight_time_held', label: 'Time Held' },
+											{ key: 'weight_stop_proximity', label: 'Stop Proximity' },
+											{ key: 'weight_volume_decay', label: 'Volume Decay' }
+										] as weight}
+											<div class="flex items-center justify-between">
+												<span class="text-xs text-muted">{weight.label}</span>
+												<div class="flex items-center gap-2">
+													<input
+														type="range"
+														min="0"
+														max="100"
+														step="5"
+														value={tempWeights[weight.key] * 100}
+														oninput={(e) => tempWeights[weight.key] = parseInt(e.currentTarget.value) / 100}
+														class="w-24 h-1 bg-terminal-card rounded-lg appearance-none cursor-pointer"
+													/>
+													<span class="text-xs w-8 text-right">{(tempWeights[weight.key] * 100).toFixed(0)}%</span>
+												</div>
+											</div>
+										{/each}
+										<div class="flex justify-between text-xs font-medium pt-2 border-t border-terminal-border">
+											<span>Total</span>
+											<span class:text-profit={Math.abs(getTotalWeight() - 1.0) < 0.01}
+												  class:text-loss={Math.abs(getTotalWeight() - 1.0) >= 0.01}>
+												{(getTotalWeight() * 100).toFixed(0)}%
+											</span>
+										</div>
 									</div>
-									<div class="text-right">
-										<p class="font-medium {getPnlColor(trade.pnl)}">{formatCurrency(trade.pnl)}</p>
-										<p class="text-sm {getPnlColor(trade.pnl_pct)}">{formatPercent(trade.pnl_pct)}</p>
+								{:else if marginConfig}
+									<div class="grid grid-cols-2 gap-1 text-xs">
+										<div class="flex justify-between"><span class="text-muted">ML Exit</span><span>{(marginConfig.weight_ml_exit * 100).toFixed(0)}%</span></div>
+										<div class="flex justify-between"><span class="text-muted">P&L Neg</span><span>{(marginConfig.weight_pnl_negative * 100).toFixed(0)}%</span></div>
+										<div class="flex justify-between"><span class="text-muted">Time</span><span>{(marginConfig.weight_time_held * 100).toFixed(0)}%</span></div>
+										<div class="flex justify-between"><span class="text-muted">Stop</span><span>{(marginConfig.weight_stop_proximity * 100).toFixed(0)}%</span></div>
+										<div class="flex justify-between"><span class="text-muted">Volume</span><span>{(marginConfig.weight_volume_decay * 100).toFixed(0)}%</span></div>
 									</div>
+								{/if}
+							</div>
+						</div>
+
+					{:else if settingsTab === 'services'}
+						<!-- Services Details -->
+						<div class="space-y-2">
+							{#each health.services as service}
+								<div class="flex items-center justify-between p-2 rounded bg-terminal-card">
+									<span class="text-sm">{service.name}</span>
+									<span class="flex items-center gap-2">
+										<span class="text-xs text-muted">{service.status}</span>
+										<span class="h-2 w-2 rounded-full {getStatusColor(service.status)}"></span>
+									</span>
 								</div>
 							{/each}
 						</div>
-					{:else}
-						<div class="p-8 text-center text-[var(--color-text-muted)]">
-							No trades closed today
-						</div>
 					{/if}
 				</div>
-
-			{:else if activeTab === 'scanner'}
-				<!-- Scanner Tab -->
-				<div class="grid grid-cols-1 gap-6 lg:grid-cols-2">
-					<!-- Pipeline Stats -->
-					{#if pipeline}
-						<div class="rounded-xl bg-[var(--color-surface)] p-6 shadow-sm">
-							<h2 class="mb-4 text-lg font-semibold text-[var(--color-text)]">Stock Pipeline</h2>
-							<div class="space-y-3">
-								<div class="flex items-center justify-between">
-									<span class="text-[var(--color-text-muted)]">Scanned</span>
-									<span class="font-medium text-[var(--color-text)]">{pipeline.stock.scanned}</span>
-								</div>
-								<div class="flex items-center justify-between">
-									<span class="text-[var(--color-text-muted)]">Passed Volume</span>
-									<span class="font-medium text-[var(--color-text)]">{pipeline.stock.passed_volume}</span>
-								</div>
-								<div class="flex items-center justify-between">
-									<span class="text-[var(--color-text-muted)]">Passed Pattern</span>
-									<span class="font-medium text-[var(--color-text)]">{pipeline.stock.passed_pattern}</span>
-								</div>
-								<div class="flex items-center justify-between">
-									<span class="text-[var(--color-text-muted)]">Passed ML</span>
-									<span class="font-medium text-[var(--color-text)]">{pipeline.stock.passed_ml}</span>
-								</div>
-								<div class="flex items-center justify-between">
-									<span class="text-[var(--color-text-muted)]">Entered</span>
-									<span class="font-medium text-green-500">{pipeline.stock.entered}</span>
-								</div>
-								<div class="flex items-center justify-between">
-									<span class="text-[var(--color-text-muted)]">Rejected</span>
-									<span class="font-medium text-red-500">{pipeline.stock.rejected}</span>
-								</div>
-							</div>
-						</div>
-
-						<div class="rounded-xl bg-[var(--color-surface)] p-6 shadow-sm">
-							<h2 class="mb-4 text-lg font-semibold text-[var(--color-text)]">Forex Pipeline</h2>
-							<div class="space-y-3">
-								<div class="flex items-center justify-between">
-									<span class="text-[var(--color-text-muted)]">Pairs Monitored</span>
-									<span class="font-medium text-[var(--color-text)]">{pipeline.forex.pairs_monitored}</span>
-								</div>
-								<div class="flex items-center justify-between">
-									<span class="text-[var(--color-text-muted)]">Signals Detected</span>
-									<span class="font-medium text-[var(--color-text)]">{pipeline.forex.signals_detected}</span>
-								</div>
-								<div class="flex items-center justify-between">
-									<span class="text-[var(--color-text-muted)]">Passed ML</span>
-									<span class="font-medium text-[var(--color-text)]">{pipeline.forex.passed_ml}</span>
-								</div>
-								<div class="flex items-center justify-between">
-									<span class="text-[var(--color-text-muted)]">Entered</span>
-									<span class="font-medium text-green-500">{pipeline.forex.entered}</span>
-								</div>
-								<div class="flex items-center justify-between">
-									<span class="text-[var(--color-text-muted)]">Rejected</span>
-									<span class="font-medium text-red-500">{pipeline.forex.rejected}</span>
-								</div>
-							</div>
-						</div>
-					{:else}
-						<div class="rounded-xl bg-[var(--color-surface)] p-6 text-center shadow-sm lg:col-span-2">
-							<p class="text-[var(--color-text-muted)]">Waiting for scanner data...</p>
-						</div>
-					{/if}
-
-					<!-- Recommendations -->
-					<div class="rounded-xl bg-[var(--color-surface)] p-6 shadow-sm lg:col-span-2">
-						<h2 class="mb-4 text-lg font-semibold text-[var(--color-text)]">Top Candidates</h2>
-						{#if recommendations.length > 0}
-							<div class="grid gap-3 md:grid-cols-2">
-								{#each recommendations as candidate}
-									<div class="rounded-lg bg-[var(--color-bg)] p-4">
-										<div class="flex items-center justify-between">
-											<span class="font-medium text-[var(--color-text)]">{candidate.symbol}</span>
-											<span
-												class="rounded-full px-2 py-0.5 text-xs font-medium"
-												class:bg-green-100={candidate.ml_score > 0.8}
-												class:text-green-800={candidate.ml_score > 0.8}
-												class:bg-yellow-100={candidate.ml_score <= 0.8}
-												class:text-yellow-800={candidate.ml_score <= 0.8}
-											>
-												ML: {(candidate.ml_score * 100).toFixed(0)}%
-											</span>
-										</div>
-										<p class="mt-1 text-sm text-[var(--color-text-muted)]">
-											{candidate.pattern}
-											{#if candidate.volume_ratio}
-												- Vol x{candidate.volume_ratio.toFixed(1)}
-											{/if}
-										</p>
-										{#if candidate.reason_skip}
-											<p class="mt-1 text-xs text-orange-500">Skip: {candidate.reason_skip}</p>
-										{:else}
-											<p class="mt-1 text-xs text-green-500">Ready to enter</p>
-										{/if}
-									</div>
-								{/each}
-							</div>
-						{:else}
-							<p class="text-center text-[var(--color-text-muted)]">No candidates</p>
-						{/if}
-					</div>
-				</div>
-			{/if}
-		</main>
-	</div>
+			</div>
+		</div>
+	{/if}
 {/if}
+
+<!-- Position Detail Modal -->
+<PositionDetailModal position={selectedPosition} onClose={() => (selectedPosition = null)} />
+
+<style>
+	/* Terminal Dark Theme Colors */
+	:global(:root) {
+		--terminal-base: #0a0e14;
+		--terminal-panel: #0f1419;
+		--terminal-card: #151b23;
+		--terminal-hover: #1a2230;
+		--terminal-border: #1e2530;
+
+		--text-primary: #e6e8eb;
+		--text-secondary: #8b9198;
+		--text-tertiary: #5c6370;
+
+		--color-profit: #00d26a;
+		--color-loss: #ff3b30;
+		--color-warning: #f5a623;
+		--color-info: #0a84ff;
+	}
+
+	/* Utility Classes */
+	.bg-terminal-base { background-color: var(--terminal-base); }
+	.bg-terminal-panel { background-color: var(--terminal-panel); }
+	.bg-terminal-card { background-color: var(--terminal-card); }
+	.bg-terminal-hover { background-color: var(--terminal-hover); }
+	.border-terminal-border { border-color: var(--terminal-border); }
+
+	.text-primary { color: var(--text-primary); }
+	.text-muted { color: var(--text-secondary); }
+
+	.text-profit { color: var(--color-profit); }
+	.text-loss { color: var(--color-loss); }
+	.text-warning { color: var(--color-warning); }
+	.text-info { color: var(--color-info); }
+
+	.bg-profit { background-color: var(--color-profit); }
+	.bg-loss { background-color: var(--color-loss); }
+	.bg-warning { background-color: var(--color-warning); }
+	.bg-info { background-color: var(--color-info); }
+
+	.bg-profit-dim { background-color: rgba(0, 210, 106, 0.15); }
+	.bg-loss-dim { background-color: rgba(255, 59, 48, 0.15); }
+	.bg-warning-dim { background-color: rgba(245, 166, 35, 0.15); }
+	.bg-info-dim { background-color: rgba(10, 132, 255, 0.15); }
+	.bg-purple-dim { background-color: rgba(168, 85, 247, 0.2); }
+
+	.tabular-nums { font-variant-numeric: tabular-nums; }
+
+	/* Custom scrollbar */
+	::-webkit-scrollbar {
+		width: 6px;
+		height: 6px;
+	}
+	::-webkit-scrollbar-track {
+		background: var(--terminal-base);
+	}
+	::-webkit-scrollbar-thumb {
+		background: var(--terminal-border);
+		border-radius: 3px;
+	}
+	::-webkit-scrollbar-thumb:hover {
+		background: var(--text-tertiary);
+	}
+
+	/* Range slider styling */
+	input[type="range"] {
+		-webkit-appearance: none;
+		appearance: none;
+		background: transparent;
+	}
+	input[type="range"]::-webkit-slider-thumb {
+		-webkit-appearance: none;
+		appearance: none;
+		width: 14px;
+		height: 14px;
+		border-radius: 50%;
+		background: var(--color-info);
+		cursor: pointer;
+		margin-top: -5px;
+	}
+	input[type="range"]::-webkit-slider-runnable-track {
+		width: 100%;
+		height: 4px;
+		background: var(--terminal-card);
+		border-radius: 2px;
+	}
+</style>

@@ -114,6 +114,7 @@ export interface Position {
 	asset_type: 'stock' | 'forex';
 	entry_time: number;
 	score: number;
+	ml_score: number;  // V7.14: ML entry score for display
 }
 
 export interface ClosedTrade {
@@ -123,6 +124,13 @@ export interface ClosedTrade {
 	exit_reason: string;
 	exit_time: string;
 	duration_min: number;
+	// V7.47.2: Enriched fields
+	quantity?: number;
+	entry_price?: number;
+	exit_price?: number;
+	ml_score?: number;
+	asset_type?: 'stock' | 'forex';
+	is_win?: boolean;
 }
 
 export interface PortfolioSummary {
@@ -272,6 +280,105 @@ export interface TradingConfig {
 	timestamp?: string;
 }
 
+// V7.26: Position Size Limits
+export interface PositionLimitsConfig {
+	stock: {
+		max_position_value: number;
+		min_position_value: number;
+	};
+	forex: {
+		max_position_value: number;
+		min_units: number;
+	};
+	timestamp?: string;
+}
+
+// V7.29: Budget Allocation Config
+export interface BudgetAllocationConfig {
+	allocation: {
+		stock_percent: number;
+		forex_percent: number;
+		reserve_percent: number;
+	};
+	enforce_limits: boolean;
+	account_equity: number;
+	budgets: {
+		stock: {
+			budget: number;
+			used: number;
+			available: number;
+			utilization_pct: number;
+		};
+		forex: {
+			budget: number;
+			used: number;
+			available: number;
+			utilization_pct: number;
+		};
+	};
+	timestamp?: string;
+}
+
+// V7.25: Historical Statistics Types
+export interface DailyStats {
+	date: string;
+	trades: number;
+	wins: number;
+	losses: number;
+	win_rate: number;
+	realized_pnl: number;
+	avg_pnl_per_trade: number;
+	profit_factor: number;
+	max_win: number;
+	max_loss: number;
+	avg_holding_min: number;
+	best_strategy: string;
+	stocks_traded: number;
+	forex_traded: number;
+}
+
+export interface MLMetrics {
+	date: string;
+	predictions: number;
+	correct_predictions: number;
+	accuracy: number;
+	precision: number;
+	recall: number;
+	f1_score: number;
+	profit_from_ml: number;
+	profit_from_non_ml: number;
+}
+
+export interface HistorySummary {
+	period_days: number;
+	total_trades: number;
+	total_pnl: number;
+	overall_win_rate: number;
+	overall_profit_factor: number;
+	best_day: string | null;
+	worst_day: string | null;
+	best_day_pnl: number;
+	worst_day_pnl: number;
+	avg_daily_pnl: number;
+	daily_stats: DailyStats[];
+	ml_metrics: MLMetrics[];
+	timestamp?: string;
+}
+
+export interface AllTimeStats {
+	total_trades: number;
+	total_wins: number;
+	total_losses: number;
+	win_rate: number;
+	total_pnl: number;
+	profit_factor: number;
+	avg_pnl_per_trade: number;
+	first_trade_date: string | null;
+	last_trade_date: string | null;
+	trading_days: number;
+	timestamp?: string;
+}
+
 // ==================== STORE STATE ====================
 
 export interface TradingState {
@@ -314,6 +421,16 @@ export interface TradingState {
 	marginProtectionConfig: MarginProtectionConfig | null;
 	marginProtectionScores: MarginProtectionScores | null;
 	tradingConfig: TradingConfig | null;
+
+	// V7.25: Historical Statistics
+	historySummary: HistorySummary | null;
+	allTimeStats: AllTimeStats | null;
+
+	// V7.26: Position Size Limits
+	positionLimits: PositionLimitsConfig | null;
+
+	// V7.29: Budget Allocation
+	budgetConfig: BudgetAllocationConfig | null;
 }
 
 const initialState: TradingState = {
@@ -346,13 +463,24 @@ const initialState: TradingState = {
 	// V7.5: Margin Protection
 	marginProtectionConfig: null,
 	marginProtectionScores: null,
-	tradingConfig: null
+	tradingConfig: null,
+
+	// V7.25: Historical Statistics
+	historySummary: null,
+	allTimeStats: null,
+
+	// V7.26: Position Size Limits
+	positionLimits: null,
+
+	// V7.29: Budget Allocation
+	budgetConfig: null
 };
 
 // ==================== STALE DATA DETECTION ====================
 
 // How long before data is considered stale (trader heartbeat is every 60s)
-const STALE_THRESHOLD_MS = 75_000; // 75 seconds = 60s heartbeat + 15s margin
+// V7.6: Increased to 180s (3 min) to handle network latency and missed heartbeats
+const STALE_THRESHOLD_MS = 180_000; // 180 seconds = 3x heartbeat interval
 
 // Check if lastUpdate timestamp is stale
 function isDataStale(lastUpdate: string | null): boolean {
@@ -460,7 +588,52 @@ const TOPIC_HANDLERS: Record<string, (state: TradingState, payload: unknown) => 
 	}),
 	'trader/config/trading': (state, payload) => ({
 		tradingConfig: payload as TradingConfig
-	})
+	}),
+	// V7.26: Position Size Limits
+	'trader/config/position_limits': (_state, payload) => ({
+		positionLimits: payload as PositionLimitsConfig
+	}),
+	// V7.29: Budget Allocation
+	'trader/config/budget': (_state, payload) => ({
+		budgetConfig: payload as BudgetAllocationConfig
+	}),
+	// V7.25: Historical Statistics topics
+	'trader/history/daily_stats': (_state, payload) => ({
+		historySummary: payload as HistorySummary
+	}),
+	'trader/history/all_time': (_state, payload) => ({
+		allTimeStats: payload as AllTimeStats
+	}),
+	'trader/history/update': (state, payload) => {
+		// Incremental update - merge with existing history
+		const data = payload as { daily_stats: DailyStats; ml_metrics: MLMetrics };
+		if (!state.historySummary) return {};
+
+		// Update the matching day in daily_stats array
+		const updatedDailyStats = state.historySummary.daily_stats.map(ds =>
+			ds.date === data.daily_stats.date ? data.daily_stats : ds
+		);
+		// Add if not found
+		if (!updatedDailyStats.find(ds => ds.date === data.daily_stats.date)) {
+			updatedDailyStats.unshift(data.daily_stats);
+		}
+
+		// Same for ml_metrics
+		const updatedMLMetrics = state.historySummary.ml_metrics.map(ml =>
+			ml.date === data.ml_metrics.date ? data.ml_metrics : ml
+		);
+		if (!updatedMLMetrics.find(ml => ml.date === data.ml_metrics.date)) {
+			updatedMLMetrics.unshift(data.ml_metrics);
+		}
+
+		return {
+			historySummary: {
+				...state.historySummary,
+				daily_stats: updatedDailyStats,
+				ml_metrics: updatedMLMetrics
+			}
+		};
+	}
 };
 
 // ==================== STORE ====================
@@ -564,7 +737,7 @@ function createTradingStore() {
 		}
 	}
 
-	function handleMessage(message: { type: string; topic?: string; payload?: unknown }) {
+	function handleMessage(message: { type: string; topic?: string; payload?: unknown; timestamp?: string }) {
 		console.log('[Trading] Message received:', message.type, message.topic);
 		if (message.type === 'mqtt' && message.topic && message.payload) {
 			const handler = TOPIC_HANDLERS[message.topic];
@@ -574,16 +747,19 @@ function createTradingStore() {
 					const updates = handler(state, message.payload);
 					console.log('[Trading] State updated:', Object.keys(updates));
 
-					// V7.5: Use timestamp from payload if available (critical for stale detection)
-					// MQTT retained messages have old timestamps - don't use current time!
+					// V7.47: Use timestamp from message wrapper first (backend adds this),
+					// then payload timestamp, then current time as fallback
 					const payload = message.payload as Record<string, unknown>;
 					const payloadTimestamp = payload?.timestamp as string | undefined;
-					const messageTime = payloadTimestamp || new Date().toISOString();
+					const messageTime = message.timestamp || payloadTimestamp || new Date().toISOString();
 
+					// V7.47: Clear stale error when we receive fresh data
+					// This fixes the "Trader offline" message persisting after reconnection
 					return {
 						...state,
 						...updates,
-						lastUpdate: messageTime
+						lastUpdate: messageTime,
+						error: null  // Clear any stale-related errors
 					};
 				});
 			} else {
@@ -673,6 +849,33 @@ function createTradingStore() {
 		});
 	}
 
+	// V7.13: Update minimum cushion for entry blocking
+	function updateMinCushion(minCushionPct: number) {
+		return sendCommand('trader/control/config/min_cushion', {
+			min_cushion_pct: minCushionPct,
+			source: 'dashboard'
+		});
+	}
+
+	// V7.26: Update position size limits
+	function updatePositionLimits(stockMaxValue: number, forexMaxValue: number) {
+		return sendCommand('trader/control/config/position_limits', {
+			stock_max_value: stockMaxValue,
+			forex_max_value: forexMaxValue,
+			source: 'dashboard'
+		});
+	}
+
+	// V7.29: Update budget allocation
+	function updateBudgetAllocation(stockPct: number, forexPct: number, enforceLimits: boolean) {
+		return sendCommand('trader/control/config/budget', {
+			stock_budget_pct: stockPct,
+			forex_budget_pct: forexPct,
+			enforce_limits: enforceLimits,
+			source: 'dashboard'
+		});
+	}
+
 	return {
 		subscribe,
 		connect,
@@ -686,7 +889,13 @@ function createTradingStore() {
 		// V7.5: Margin Protection methods
 		toggleMarginProtection,
 		updateMarginProtectionConfig,
-		updateMaxPositions
+		updateMaxPositions,
+		// V7.13: Min cushion control
+		updateMinCushion,
+		// V7.26: Position size limits
+		updatePositionLimits,
+		// V7.29: Budget allocation
+		updateBudgetAllocation
 	};
 }
 
@@ -729,6 +938,8 @@ export const portfolioMetrics = derived(trading, ($trading) => {
 		equity: $trading.summary.equity,
 		pnlTotal: $trading.summary.pnl_total,
 		pnlPct: $trading.summary.pnl_pct,
+		pnlRealized: $trading.summary.pnl_realized,      // V7.12: Add realized P&L
+		pnlUnrealized: $trading.summary.pnl_unrealized,  // V7.12: Add unrealized P&L
 		winRate: $trading.summary.win_rate_today,
 		positionsOpen: $trading.summary.positions_open,
 		tradesToday: $trading.summary.trades_today,
