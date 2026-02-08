@@ -12,7 +12,8 @@
 		portfolioMetrics,
 		topPositions,
 		hasErrors,
-		traderStatus
+		traderStatus,
+		swingStatus
 	} from '$stores/trading';
 
 	// Access control: only admin or simon
@@ -39,7 +40,7 @@
 	let recommendations = $derived($trading.recommendations);
 
 	// Active view for center panel
-	let activeView = $state<'positions' | 'scanner' | 'history'>('positions');
+	let activeView = $state<'positions' | 'scanner' | 'swing' | 'history'>('positions');
 
 	// Settings modal state
 	let showSettingsModal = $state(false);
@@ -88,6 +89,31 @@
 
 	// V7.29: Budget Allocation
 	let budgetConfig = $derived($trading.budgetConfig);
+
+	// V8: Swing Trading
+	let swingStatusData = $derived($swingStatus);
+	let swingCandidates = $derived($trading.swingCandidates);
+	let swingPositions = $derived($trading.swingPositions);
+	let swingHeartbeat = $derived($trading.swingHeartbeat);
+	let swingLastScan = $derived($trading.swingLastScan);
+	let swingConfig = $derived($trading.swingConfig);
+
+	// V8: Local state for editing swing config
+	let editingSwingConfig = $state(false);
+	let tempSwingBudgetPct = $state(20);
+	let tempSwingMaxPositions = $state(5);
+	let tempSwingMaxPositionSize = $state(5000);
+	let tempSwingAutoEntry = $state(false);
+
+	// Sync swing config temp values when config changes
+	$effect(() => {
+		if (swingConfig) {
+			tempSwingBudgetPct = swingConfig.budget_pct;
+			tempSwingMaxPositions = swingConfig.max_positions;
+			tempSwingMaxPositionSize = swingConfig.max_position_size;
+			tempSwingAutoEntry = swingConfig.auto_entry;
+		}
+	});
 
 	// Local state for editing margin protection weights
 	let editingWeights = $state(false);
@@ -159,23 +185,36 @@
 		trading.updatePositionLimits(tempStockMaxValue, tempForexMaxValue);
 	}
 
-	// V7.29: Budget Allocation
-	let tempStockBudgetPct = $state(60);
-	let tempForexBudgetPct = $state(30);
+	// V7.29: Budget Allocation (V8: includes coordinated swing allocation)
+	let tempStockBudgetPct = $state(50);
+	let tempForexBudgetPct = $state(20);
+	let tempSwingBudgetPctSettings = $state(20);  // V8: Swing allocation in settings
 	let tempEnforceBudgetLimits = $state(true);
+
+	// V8: Computed reserve (what's left after allocations)
+	let tempReservePct = $derived(100 - tempStockBudgetPct - tempForexBudgetPct - tempSwingBudgetPctSettings);
+	let totalAllocation = $derived(tempStockBudgetPct + tempForexBudgetPct + tempSwingBudgetPctSettings);
 
 	$effect(() => {
 		if (budgetConfig) {
-			tempStockBudgetPct = budgetConfig.allocation?.stock_percent ?? 60;
-			tempForexBudgetPct = budgetConfig.allocation?.forex_percent ?? 30;
+			tempStockBudgetPct = budgetConfig.allocation?.stock_percent ?? 50;
+			tempForexBudgetPct = budgetConfig.allocation?.forex_percent ?? 20;
+			tempSwingBudgetPctSettings = budgetConfig.allocation?.swing_percent ?? 20;
 			tempEnforceBudgetLimits = budgetConfig.enforce_limits ?? true;
 		}
 	});
 
+	// V8: Also sync from swing config if budget not available
+	$effect(() => {
+		if (!budgetConfig && swingConfig) {
+			tempSwingBudgetPctSettings = swingConfig.budget_pct;
+		}
+	});
+
 	function saveBudgetAllocation() {
-		const total = tempStockBudgetPct + tempForexBudgetPct;
+		const total = tempStockBudgetPct + tempForexBudgetPct + tempSwingBudgetPctSettings;
 		if (total > 100) {
-			alert(`Stock + Forex cannot exceed 100% (currently ${total}%)`);
+			alert(`Total allocation cannot exceed 100% (currently ${total}%)`);
 			return;
 		}
 		if (tempStockBudgetPct < 0 || tempStockBudgetPct > 100) {
@@ -186,7 +225,41 @@
 			alert('Forex budget must be between 0% and 100%');
 			return;
 		}
-		trading.updateBudgetAllocation(tempStockBudgetPct, tempForexBudgetPct, tempEnforceBudgetLimits);
+		if (tempSwingBudgetPctSettings < 0 || tempSwingBudgetPctSettings > 100) {
+			alert('Swing budget must be between 0% and 100%');
+			return;
+		}
+		trading.updateBudgetAllocation(
+			tempStockBudgetPct,
+			tempForexBudgetPct,
+			tempSwingBudgetPctSettings,
+			tempEnforceBudgetLimits
+		);
+		// Also sync to swing config temp values
+		tempSwingBudgetPct = tempSwingBudgetPctSettings;
+	}
+
+	// V8: Save swing trading config
+	function saveSwingConfig() {
+		if (tempSwingBudgetPct < 0 || tempSwingBudgetPct > 100) {
+			alert('Swing budget must be between 0% and 100%');
+			return;
+		}
+		if (tempSwingMaxPositions < 1 || tempSwingMaxPositions > 20) {
+			alert('Max positions must be between 1 and 20');
+			return;
+		}
+		if (tempSwingMaxPositionSize < 100 || tempSwingMaxPositionSize > 50000) {
+			alert('Max position size must be between $100 and $50,000');
+			return;
+		}
+		trading.updateSwingConfig({
+			budget_pct: tempSwingBudgetPct,
+			max_positions: tempSwingMaxPositions,
+			max_position_size: tempSwingMaxPositionSize,
+			auto_entry: tempSwingAutoEntry
+		});
+		editingSwingConfig = false;
 	}
 
 	function getTotalWeight(): number {
@@ -322,7 +395,8 @@
 		if (e.key === 'Escape') showSettingsModal = false;
 		if (e.key === '1' && e.ctrlKey) { activeView = 'positions'; e.preventDefault(); }
 		if (e.key === '2' && e.ctrlKey) { activeView = 'scanner'; e.preventDefault(); }
-		if (e.key === '3' && e.ctrlKey) { activeView = 'history'; e.preventDefault(); }
+		if (e.key === '3' && e.ctrlKey) { activeView = 'swing'; e.preventDefault(); }
+		if (e.key === '4' && e.ctrlKey) { activeView = 'history'; e.preventDefault(); }
 	}
 </script>
 
@@ -687,6 +761,19 @@
 							Scanner
 						</button>
 						<button
+							onclick={() => activeView = 'swing'}
+							class="rounded px-3 py-1 text-xs font-medium transition-colors hover:text-primary flex items-center gap-1"
+							class:bg-terminal-panel={activeView === 'swing'}
+							class:text-primary={activeView === 'swing'}
+							class:text-muted={activeView !== 'swing'}>
+							<span class="h-2 w-2 rounded-full"
+								class:bg-profit={swingStatusData.status === 'RUNNING'}
+								class:bg-warning={swingStatusData.status === 'SCANNING'}
+								class:bg-loss={swingStatusData.status === 'ERROR' || swingStatusData.status === 'STOPPED'}
+								class:bg-muted={swingStatusData.status === 'OFFLINE' || swingStatusData.status === 'UNKNOWN'}></span>
+							Swing
+						</button>
+						<button
 							onclick={() => activeView = 'history'}
 							class="rounded px-3 py-1 text-xs font-medium transition-colors hover:text-primary"
 							class:bg-terminal-panel={activeView === 'history'}
@@ -1029,6 +1116,353 @@
 							</div>
 						</div>
 
+					{:else if activeView === 'swing'}
+						<!-- ==================== SWING TRADING VIEW ==================== -->
+						<div class="space-y-3">
+							<!-- Swing Status Header -->
+							<div class="grid grid-cols-4 gap-3">
+								<div class="rounded border border-terminal-border bg-terminal-panel p-3 text-center">
+									<div class="text-[10px] text-muted uppercase">Status</div>
+									<div class="text-lg font-bold"
+										class:text-profit={swingStatusData.status === 'RUNNING'}
+										class:text-warning={swingStatusData.status === 'SCANNING'}
+										class:text-loss={swingStatusData.status === 'ERROR' || swingStatusData.status === 'STOPPED'}
+										class:text-muted={swingStatusData.status === 'OFFLINE'}>
+										{swingStatusData.status}
+									</div>
+								</div>
+								<div class="rounded border border-terminal-border bg-terminal-panel p-3 text-center">
+									<div class="text-[10px] text-muted uppercase">Last Scan</div>
+									<div class="text-sm font-medium tabular-nums">
+										{#if swingStatusData.lastScan}
+											{new Date(swingStatusData.lastScan).toLocaleTimeString()}
+										{:else}
+											--:--
+										{/if}
+									</div>
+									<div class="text-xs text-muted">{swingStatusData.candidatesFound} found</div>
+								</div>
+								<div class="rounded border border-terminal-border bg-terminal-panel p-3 text-center">
+									<div class="text-[10px] text-muted uppercase">Positions</div>
+									<div class="text-lg font-bold tabular-nums text-info">
+										{swingStatusData.activePositions}
+									</div>
+								</div>
+								<div class="rounded border border-terminal-border bg-terminal-panel p-3 text-center">
+									<div class="text-[10px] text-muted uppercase">ML Model</div>
+									<div class="text-lg font-bold" class:text-profit={swingStatusData.mlLoaded} class:text-loss={!swingStatusData.mlLoaded}>
+										{swingStatusData.mlLoaded ? 'LOADED' : 'OFF'}
+									</div>
+								</div>
+							</div>
+
+							<!-- Swing Configuration Panel -->
+							<div class="rounded border border-terminal-border bg-terminal-panel">
+								<div class="flex items-center justify-between border-b border-terminal-border px-3 py-2">
+									<h2 class="text-xs font-medium uppercase tracking-wide text-muted">Swing Configuration</h2>
+									{#if !editingSwingConfig}
+										<button onclick={() => editingSwingConfig = true} class="text-xs text-info hover:underline">Edit</button>
+									{:else}
+										<div class="flex gap-2">
+											<button onclick={saveSwingConfig} class="text-xs text-profit hover:underline">Save</button>
+											<button onclick={() => editingSwingConfig = false} class="text-xs text-loss hover:underline">Cancel</button>
+										</div>
+									{/if}
+								</div>
+								<div class="p-3">
+									{#if editingSwingConfig}
+										<!-- Editing Mode -->
+										<div class="grid grid-cols-2 gap-4">
+											<div>
+												<label class="block text-xs text-muted mb-1">Capital Allocation: <span class="text-info font-medium">{tempSwingBudgetPct}%</span></label>
+												<div class="relative h-3">
+													<div class="absolute inset-0 rounded-full bg-terminal-hover border border-terminal-border"></div>
+													<div class="absolute top-0 left-0 h-full rounded-l-full bg-info" style="width: {tempSwingBudgetPct * 2}%"></div>
+													<input
+														type="range"
+														bind:value={tempSwingBudgetPct}
+														min="0"
+														max="50"
+														step="5"
+														class="absolute inset-0 w-full h-full bg-transparent appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-info [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:shadow-lg [&::-moz-range-thumb]:w-4 [&::-moz-range-thumb]:h-4 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:bg-info [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-white [&::-moz-range-thumb]:shadow-lg"
+													/>
+												</div>
+											</div>
+											<div>
+												<label class="block text-xs text-muted mb-1">Max Positions: <span class="text-purple-400 font-medium">{tempSwingMaxPositions}</span></label>
+												<div class="relative h-3">
+													<div class="absolute inset-0 rounded-full bg-terminal-hover border border-terminal-border"></div>
+													<div class="absolute top-0 left-0 h-full rounded-l-full bg-purple-500" style="width: {(tempSwingMaxPositions / 20) * 100}%"></div>
+													<input
+														type="range"
+														bind:value={tempSwingMaxPositions}
+														min="1"
+														max="20"
+														step="1"
+														class="absolute inset-0 w-full h-full bg-transparent appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-purple-500 [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:shadow-lg [&::-moz-range-thumb]:w-4 [&::-moz-range-thumb]:h-4 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:bg-purple-500 [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-white [&::-moz-range-thumb]:shadow-lg"
+													/>
+												</div>
+											</div>
+											<div>
+												<label class="block text-xs text-muted mb-1">Max Position Size</label>
+												<input
+													type="number"
+													bind:value={tempSwingMaxPositionSize}
+													min="100"
+													max="50000"
+													step="500"
+													class="w-full rounded border border-terminal-border bg-terminal-hover text-primary px-2 py-1 text-sm focus:border-info focus:outline-none"
+												/>
+											</div>
+											<div class="flex items-center justify-between">
+												<span class="text-sm">Auto-Entry</span>
+												<button
+													onclick={() => tempSwingAutoEntry = !tempSwingAutoEntry}
+													class="relative h-5 w-9 rounded-full transition-colors"
+													class:bg-profit={tempSwingAutoEntry}
+													class:bg-terminal-card={!tempSwingAutoEntry}>
+													<span
+														class="absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform"
+														class:left-0.5={!tempSwingAutoEntry}
+														class:left-4={tempSwingAutoEntry}></span>
+												</button>
+											</div>
+										</div>
+									{:else}
+										<!-- Display Mode -->
+										<div class="grid grid-cols-4 gap-4 text-sm">
+											<div class="flex justify-between">
+												<span class="text-muted">Capital</span>
+												<span class="font-medium tabular-nums">{swingConfig?.budget_pct ?? tempSwingBudgetPct}%</span>
+											</div>
+											<div class="flex justify-between">
+												<span class="text-muted">Max Pos.</span>
+												<span class="font-medium tabular-nums">{swingConfig?.max_positions ?? tempSwingMaxPositions}</span>
+											</div>
+											<div class="flex justify-between">
+												<span class="text-muted">Size Limit</span>
+												<span class="font-medium tabular-nums">${(swingConfig?.max_position_size ?? tempSwingMaxPositionSize).toLocaleString()}</span>
+											</div>
+											<div class="flex justify-between">
+												<span class="text-muted">Auto-Entry</span>
+												<span class:text-profit={swingConfig?.auto_entry ?? tempSwingAutoEntry} class:text-loss={!(swingConfig?.auto_entry ?? tempSwingAutoEntry)}>
+													{(swingConfig?.auto_entry ?? tempSwingAutoEntry) ? 'ON' : 'OFF'}
+												</span>
+											</div>
+										</div>
+									{/if}
+								</div>
+							</div>
+
+							<!-- Swing Positions (priority - show first if any) -->
+							{#if swingPositions.length > 0}
+								<div class="rounded border border-terminal-border bg-terminal-panel">
+									<div class="border-b border-terminal-border px-3 py-2">
+										<h2 class="text-xs font-medium uppercase tracking-wide text-muted">
+											Swing Positions ({swingPositions.length})
+										</h2>
+									</div>
+									<div class="overflow-x-auto">
+										<table class="w-full text-xs">
+											<thead class="bg-terminal-card">
+												<tr>
+													<th class="px-3 py-2 text-left font-medium text-muted">Symbol</th>
+													<th class="px-3 py-2 text-center font-medium text-muted"></th>
+													<th class="px-3 py-2 text-left font-medium text-muted">Pattern</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">Qty</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">Entry</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">Current</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">P&L</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">%</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">Stop</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">Target</th>
+												</tr>
+											</thead>
+											<tbody class="divide-y divide-terminal-border">
+												{#each swingPositions as pos}
+													<tr class="hover:bg-terminal-hover">
+														<td class="px-3 py-2 font-medium">{pos.symbol}</td>
+														<td class="px-2 py-2 text-center">
+															<button
+																onclick={() => openChart(pos.symbol, 'stock', 'D')}
+																class="px-2 py-1 rounded bg-terminal-card hover:bg-terminal-hover text-xs"
+																title="View Daily Chart"
+															>
+																📊
+															</button>
+														</td>
+														<td class="px-3 py-2">
+															<span class="rounded px-1.5 py-0.5 text-[10px] font-medium bg-info-dim text-info">
+																{pos.pattern_type}
+															</span>
+														</td>
+														<td class="px-3 py-2 text-right tabular-nums">{pos.quantity}</td>
+														<td class="px-3 py-2 text-right tabular-nums text-muted">
+															${pos.entry_price.toFixed(2)}
+														</td>
+														<td class="px-3 py-2 text-right tabular-nums">
+															${pos.current_price.toFixed(2)}
+														</td>
+														<td class="px-3 py-2 text-right tabular-nums font-medium {getPnlColor(pos.unrealized_pnl)}">
+															{formatCurrency(pos.unrealized_pnl)}
+														</td>
+														<td class="px-3 py-2 text-right tabular-nums {getPnlColor(pos.pnl_percent)}">
+															{formatPercent(pos.pnl_percent)}
+														</td>
+														<td class="px-3 py-2 text-right tabular-nums text-loss">
+															${pos.stop_loss.toFixed(2)}
+														</td>
+														<td class="px-3 py-2 text-right tabular-nums text-profit">
+															${pos.target_1.toFixed(2)}
+														</td>
+													</tr>
+												{/each}
+											</tbody>
+										</table>
+									</div>
+								</div>
+							{/if}
+
+							<!-- Swing Candidates -->
+							<div class="rounded border border-terminal-border bg-terminal-panel">
+								<div class="flex items-center justify-between border-b border-terminal-border px-3 py-2">
+									<h2 class="text-xs font-medium uppercase tracking-wide text-muted">
+										Swing Candidates ({swingCandidates.length})
+									</h2>
+									<span class="text-[10px] text-muted">Daily scan at 20:00 ET</span>
+								</div>
+								{#if swingCandidates.length > 0}
+									<div class="overflow-x-auto">
+										<table class="w-full text-xs">
+											<thead class="bg-terminal-card">
+												<tr>
+													<th class="px-3 py-2 text-left font-medium text-muted">Symbol</th>
+													<th class="px-3 py-2 text-center font-medium text-muted"></th>
+													<th class="px-3 py-2 text-left font-medium text-muted">Pattern</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">Entry Zone</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">Stop</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">Target 1</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">R:R</th>
+													<th class="px-3 py-2 text-right font-medium text-muted">ML</th>
+													<th class="px-3 py-2 text-left font-medium text-muted">Factors</th>
+												</tr>
+											</thead>
+											<tbody class="divide-y divide-terminal-border">
+												{#each swingCandidates as candidate}
+													<tr class="hover:bg-terminal-hover">
+														<td class="px-3 py-2 font-medium">{candidate.symbol}</td>
+														<td class="px-2 py-2 text-center">
+															<button
+																onclick={() => openChart(candidate.symbol, 'stock', 'D')}
+																class="px-2 py-1 rounded bg-terminal-card hover:bg-terminal-hover text-xs"
+																title="View Daily Chart"
+															>
+																📊
+															</button>
+														</td>
+														<td class="px-3 py-2">
+															<span class="rounded px-1.5 py-0.5 text-[10px] font-medium bg-info-dim text-info">
+																{candidate.pattern_type}
+															</span>
+														</td>
+														<td class="px-3 py-2 text-right tabular-nums">
+															${candidate.entry_zone[0].toFixed(2)} - ${candidate.entry_zone[1].toFixed(2)}
+														</td>
+														<td class="px-3 py-2 text-right tabular-nums text-loss">
+															${candidate.stop_loss.toFixed(2)}
+														</td>
+														<td class="px-3 py-2 text-right tabular-nums text-profit">
+															${candidate.target_1.toFixed(2)}
+														</td>
+														<td class="px-3 py-2 text-right">
+															<span class="rounded px-1.5 py-0.5 text-[10px] font-medium"
+																class:bg-profit-dim={candidate.risk_reward >= 2.5}
+																class:text-profit={candidate.risk_reward >= 2.5}
+																class:bg-warning-dim={candidate.risk_reward >= 2 && candidate.risk_reward < 2.5}
+																class:text-warning={candidate.risk_reward >= 2 && candidate.risk_reward < 2.5}>
+																{candidate.risk_reward.toFixed(1)}R
+															</span>
+														</td>
+														<td class="px-3 py-2 text-right">
+															<span class="rounded px-1.5 py-0.5 text-[10px] font-medium"
+																class:bg-profit-dim={candidate.ml_score >= 0.7}
+																class:text-profit={candidate.ml_score >= 0.7}
+																class:bg-warning-dim={candidate.ml_score >= 0.5 && candidate.ml_score < 0.7}
+																class:text-warning={candidate.ml_score >= 0.5 && candidate.ml_score < 0.7}
+																class:bg-terminal-card={candidate.ml_score < 0.5}
+																class:text-muted={candidate.ml_score < 0.5}>
+																{(candidate.ml_score * 100).toFixed(0)}%
+															</span>
+														</td>
+														<td class="px-3 py-2">
+															<div class="flex flex-wrap gap-1">
+																{#each candidate.key_factors.slice(0, 3) as factor}
+																	<span class="rounded px-1 py-0.5 text-[9px] bg-terminal-card text-muted">
+																		{factor}
+																	</span>
+																{/each}
+															</div>
+														</td>
+													</tr>
+												{/each}
+											</tbody>
+										</table>
+									</div>
+								{:else}
+									<div class="p-6 text-center text-muted text-sm">
+										<div class="mb-2">No swing candidates found</div>
+										<div class="text-xs">
+											{#if swingStatusData.status === 'OFFLINE'}
+												Swing scanner is offline
+											{:else}
+												Waiting for next scan at 20:00 ET
+											{/if}
+										</div>
+									</div>
+								{/if}
+							</div>
+
+							<!-- Swing Heartbeat Details -->
+							{#if swingHeartbeat}
+								<div class="rounded border border-terminal-border bg-terminal-panel p-3">
+									<h3 class="text-xs font-medium uppercase tracking-wide text-muted mb-2">Swing Module Health</h3>
+									<div class="grid grid-cols-4 gap-4 text-sm">
+										<div class="flex justify-between">
+											<span class="text-muted">Uptime</span>
+											<span class="tabular-nums">
+												{#if swingStatusData.uptimeSeconds}
+													{Math.floor(swingStatusData.uptimeSeconds / 3600)}h {Math.floor((swingStatusData.uptimeSeconds % 3600) / 60)}m
+												{:else}
+													--
+												{/if}
+											</span>
+										</div>
+										<div class="flex justify-between">
+											<span class="text-muted">Errors (24h)</span>
+											<span class="tabular-nums" class:text-loss={swingHeartbeat.error_count_24h > 0}>
+												{swingHeartbeat.error_count_24h}
+											</span>
+										</div>
+										<div class="flex justify-between">
+											<span class="text-muted">Pending Orders</span>
+											<span class="tabular-nums">{swingHeartbeat.pending_orders}</span>
+										</div>
+										<div class="flex justify-between">
+											<span class="text-muted">DB Connected</span>
+											<span class:text-profit={swingHeartbeat.database_connected} class:text-loss={!swingHeartbeat.database_connected}>
+												{swingHeartbeat.database_connected ? 'YES' : 'NO'}
+											</span>
+										</div>
+									</div>
+									{#if swingHeartbeat.last_error}
+										<div class="mt-2 p-2 rounded bg-loss-dim text-loss text-xs">
+											Last Error: {swingHeartbeat.last_error}
+										</div>
+									{/if}
+								</div>
+							{/if}
+						</div>
+
 					{:else if activeView === 'history'}
 						<!-- ==================== HISTORY VIEW ==================== -->
 						<div class="space-y-3">
@@ -1318,32 +1752,76 @@
 						</div>
 
 					{:else if settingsTab === 'budget'}
-						<!-- Budget Allocation -->
+						<!-- V8: Coordinated Budget Allocation (Stock + Forex + Swing + Reserve = 100%) -->
 						<div class="space-y-4">
+							<div class="text-xs text-muted mb-2">Allocate capital across trading strategies. Total must not exceed 100%.</div>
+
+							<!-- Stock Day Trading -->
 							<div>
-								<label class="block text-xs text-muted mb-1">Stock Budget: {tempStockBudgetPct}%</label>
-								<input
-									type="range"
-									bind:value={tempStockBudgetPct}
-									min="0"
-									max="100"
-									step="5"
-									class="w-full h-2 bg-terminal-card rounded-lg appearance-none cursor-pointer"
-								/>
+								<div class="flex justify-between items-center mb-1">
+									<label class="text-xs text-muted">📈 Stock Day Trading</label>
+									<span class="text-sm font-medium text-info tabular-nums">{tempStockBudgetPct}%</span>
+								</div>
+								<div class="relative h-3">
+									<div class="absolute inset-0 rounded-full bg-terminal-hover border border-terminal-border"></div>
+									<div class="absolute top-0 left-0 h-full rounded-l-full bg-info" style="width: {tempStockBudgetPct}%"></div>
+									<input
+										type="range"
+										bind:value={tempStockBudgetPct}
+										min="0"
+										max="80"
+										step="5"
+										class="absolute inset-0 w-full h-full bg-transparent appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-info [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:shadow-lg [&::-moz-range-thumb]:w-4 [&::-moz-range-thumb]:h-4 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:bg-info [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-white"
+									/>
+								</div>
 							</div>
+
+							<!-- Forex Trading -->
 							<div>
-								<label class="block text-xs text-muted mb-1">Forex Budget: {tempForexBudgetPct}%</label>
-								<input
-									type="range"
-									bind:value={tempForexBudgetPct}
-									min="0"
-									max="100"
-									step="5"
-									class="w-full h-2 bg-terminal-card rounded-lg appearance-none cursor-pointer"
-								/>
+								<div class="flex justify-between items-center mb-1">
+									<label class="text-xs text-muted">💱 Forex Trading</label>
+									<span class="text-sm font-medium text-purple-400 tabular-nums">{tempForexBudgetPct}%</span>
+								</div>
+								<div class="relative h-3">
+									<div class="absolute inset-0 rounded-full bg-terminal-hover border border-terminal-border"></div>
+									<div class="absolute top-0 left-0 h-full rounded-l-full bg-purple-500" style="width: {tempForexBudgetPct}%"></div>
+									<input
+										type="range"
+										bind:value={tempForexBudgetPct}
+										min="0"
+										max="50"
+										step="5"
+										class="absolute inset-0 w-full h-full bg-transparent appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-purple-500 [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:shadow-lg [&::-moz-range-thumb]:w-4 [&::-moz-range-thumb]:h-4 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:bg-purple-500 [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-white"
+									/>
+								</div>
 							</div>
-							<div class="flex items-center justify-between">
-								<span class="text-sm">Reserve: {100 - tempStockBudgetPct - tempForexBudgetPct}%</span>
+
+							<!-- Swing Trading -->
+							<div>
+								<div class="flex justify-between items-center mb-1">
+									<label class="text-xs text-muted">🌊 Swing Trading</label>
+									<span class="text-sm font-medium text-amber-400 tabular-nums">{tempSwingBudgetPctSettings}%</span>
+								</div>
+								<div class="relative h-3">
+									<div class="absolute inset-0 rounded-full bg-terminal-hover border border-terminal-border"></div>
+									<div class="absolute top-0 left-0 h-full rounded-l-full bg-amber-500" style="width: {tempSwingBudgetPctSettings * 2}%"></div>
+									<input
+										type="range"
+										bind:value={tempSwingBudgetPctSettings}
+										min="0"
+										max="50"
+										step="5"
+										class="absolute inset-0 w-full h-full bg-transparent appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-amber-500 [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:shadow-lg [&::-moz-range-thumb]:w-4 [&::-moz-range-thumb]:h-4 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:bg-amber-500 [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-white"
+									/>
+								</div>
+							</div>
+
+							<!-- Reserve (calculated) -->
+							<div class="flex items-center justify-between py-2 border-t border-terminal-border">
+								<div class="flex items-center gap-2">
+									<span class="text-xs text-muted">💰 Reserve (Cash Buffer)</span>
+									<span class="text-sm font-medium tabular-nums" class:text-profit={tempReservePct >= 10} class:text-warning={tempReservePct < 10 && tempReservePct > 0} class:text-loss={tempReservePct <= 0}>{tempReservePct}%</span>
+								</div>
 								<label class="flex items-center gap-2">
 									<span class="text-xs text-muted">Enforce Limits</span>
 									<button
@@ -1358,25 +1836,37 @@
 									</button>
 								</label>
 							</div>
-							<!-- Visual breakdown -->
-							<div class="h-3 overflow-hidden rounded-full bg-terminal-card flex">
-								<div class="bg-info" style="width: {tempStockBudgetPct}%"></div>
-								<div class="bg-purple-500" style="width: {tempForexBudgetPct}%"></div>
-								<div class="bg-profit" style="width: {100 - tempStockBudgetPct - tempForexBudgetPct}%"></div>
+
+							<!-- Visual breakdown bar -->
+							<div class="h-4 overflow-hidden rounded-full bg-terminal-card flex border border-terminal-border">
+								<div class="bg-info transition-all" style="width: {tempStockBudgetPct}%"></div>
+								<div class="bg-purple-500 transition-all" style="width: {tempForexBudgetPct}%"></div>
+								<div class="bg-amber-500 transition-all" style="width: {tempSwingBudgetPctSettings}%"></div>
+								<div class="bg-profit transition-all" style="width: {Math.max(0, tempReservePct)}%"></div>
 							</div>
-							<div class="flex justify-between text-xs text-muted">
-								<span>Stock {tempStockBudgetPct}%</span>
-								<span>Forex {tempForexBudgetPct}%</span>
-								<span>Reserve {100 - tempStockBudgetPct - tempForexBudgetPct}%</span>
+							<div class="grid grid-cols-4 text-xs text-muted text-center">
+								<span class="text-info">Stock {tempStockBudgetPct}%</span>
+								<span class="text-purple-400">Forex {tempForexBudgetPct}%</span>
+								<span class="text-amber-400">Swing {tempSwingBudgetPctSettings}%</span>
+								<span class="text-profit">Reserve {tempReservePct}%</span>
 							</div>
-							{#if tempStockBudgetPct + tempForexBudgetPct > 100}
-								<div class="text-xs text-loss">Total exceeds 100%!</div>
+
+							<!-- Validation message -->
+							{#if totalAllocation > 100}
+								<div class="text-xs text-loss bg-loss/10 px-3 py-2 rounded">
+									⚠️ Total allocation ({totalAllocation}%) exceeds 100%! Reduce allocations by {totalAllocation - 100}%.
+								</div>
+							{:else if tempReservePct < 10}
+								<div class="text-xs text-warning bg-warning/10 px-3 py-2 rounded">
+									⚠️ Reserve below 10% recommended minimum. Consider reducing allocations.
+								</div>
 							{/if}
+
 							<button
 								onclick={saveBudgetAllocation}
-								disabled={tempStockBudgetPct + tempForexBudgetPct > 100}
-								class="rounded bg-info px-4 py-2 text-xs font-medium text-white hover:opacity-90 disabled:opacity-50">
-								Save Budget
+								disabled={totalAllocation > 100}
+								class="w-full rounded bg-info px-4 py-2 text-sm font-medium text-white hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed">
+								💾 Save Budget Allocation
 							</button>
 						</div>
 

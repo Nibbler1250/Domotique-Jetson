@@ -297,11 +297,12 @@ export interface PositionLimitsConfig {
 	timestamp?: string;
 }
 
-// V7.29: Budget Allocation Config
+// V7.29: Budget Allocation Config (V8: includes swing allocation)
 export interface BudgetAllocationConfig {
 	allocation: {
 		stock_percent: number;
 		forex_percent: number;
+		swing_percent: number;    // V8: Swing trading allocation
 		reserve_percent: number;
 	};
 	enforce_limits: boolean;
@@ -319,8 +320,76 @@ export interface BudgetAllocationConfig {
 			available: number;
 			utilization_pct: number;
 		};
+		swing?: {                 // V8: Swing budget tracking
+			budget: number;
+			used: number;
+			available: number;
+			utilization_pct: number;
+		};
 	};
 	timestamp?: string;
+}
+
+// ==================== SWING TRADING TYPES ====================
+
+export interface SwingHeartbeat {
+	timestamp: string;
+	module: string;
+	status: 'starting' | 'running' | 'scanning' | 'error' | 'stopped';
+	active_positions: number;
+	pending_orders: number;
+	last_scan_time: string | null;
+	last_scan_candidates: number;
+	error_count_24h: number;
+	last_error: string | null;
+	uptime_seconds: number;
+	ml_model_loaded: boolean;
+	database_connected: boolean;
+}
+
+export interface SwingCandidate {
+	symbol: string;
+	pattern_type: string;
+	pattern_score: number;
+	entry_zone: [number, number];
+	stop_loss: number;
+	target_1: number;
+	target_2: number;
+	risk_reward: number;
+	ml_score: number;
+	key_factors: string[];
+	regime: string;
+	scan_date: string;
+}
+
+export interface SwingScanResult {
+	timestamp: string;
+	candidates: SwingCandidate[];
+	symbols_scanned: number;
+	scan_duration_ms: number;
+}
+
+export interface SwingPosition {
+	symbol: string;
+	entry_price: number;
+	current_price: number;
+	quantity: number;
+	entry_date: string;
+	unrealized_pnl: number;
+	pnl_percent: number;
+	pattern_type: string;
+	target_1: number;
+	target_2: number;
+	stop_loss: number;
+}
+
+// V8: Swing Trading Configuration
+export interface SwingConfig {
+	enabled: boolean;
+	budget_pct: number;          // % of total capital for swing
+	max_positions: number;       // Max concurrent swing positions
+	max_position_size: number;   // Max $ per position
+	auto_entry: boolean;         // Auto-enter when candidate hits entry zone
 }
 
 // V7.25: Historical Statistics Types
@@ -435,6 +504,13 @@ export interface TradingState {
 
 	// V7.29: Budget Allocation
 	budgetConfig: BudgetAllocationConfig | null;
+
+	// V8: Swing Trading
+	swingHeartbeat: SwingHeartbeat | null;
+	swingCandidates: SwingCandidate[];
+	swingPositions: SwingPosition[];
+	swingLastScan: SwingScanResult | null;
+	swingConfig: SwingConfig | null;
 }
 
 const initialState: TradingState = {
@@ -477,7 +553,14 @@ const initialState: TradingState = {
 	positionLimits: null,
 
 	// V7.29: Budget Allocation
-	budgetConfig: null
+	budgetConfig: null,
+
+	// V8: Swing Trading
+	swingHeartbeat: null,
+	swingCandidates: [],
+	swingPositions: [],
+	swingLastScan: null,
+	swingConfig: null
 };
 
 // ==================== STALE DATA DETECTION ====================
@@ -637,7 +720,26 @@ const TOPIC_HANDLERS: Record<string, (state: TradingState, payload: unknown) => 
 				ml_metrics: updatedMLMetrics
 			}
 		};
-	}
+	},
+
+	// ==================== SWING TRADING TOPICS ====================
+	'momentum/swing/heartbeat': (_state, payload) => ({
+		swingHeartbeat: payload as SwingHeartbeat
+	}),
+	'momentum/swing/candidates': (_state, payload) => {
+		const data = payload as { candidates: SwingCandidate[] };
+		return { swingCandidates: data.candidates || [] };
+	},
+	'momentum/swing/scan_result': (_state, payload) => ({
+		swingLastScan: payload as SwingScanResult
+	}),
+	'momentum/swing/positions': (_state, payload) => {
+		const data = payload as { positions: SwingPosition[] };
+		return { swingPositions: data.positions || [] };
+	},
+	'momentum/swing/config': (_state, payload) => ({
+		swingConfig: payload as SwingConfig
+	})
 };
 
 // ==================== STORE ====================
@@ -687,6 +789,27 @@ function createTradingStore() {
 		}
 	}
 
+	// V8: Fetch swing state from REST API (backup for missed MQTT retained messages)
+	async function fetchSwingState() {
+		try {
+			const response = await fetch('/api/v1/trading/swing/state');
+			if (!response.ok) return;
+
+			const data = await response.json();
+			console.log('[Trading] Fetched swing state from REST API:', data);
+
+			update(state => ({
+				...state,
+				swingHeartbeat: data.heartbeat || state.swingHeartbeat,
+				swingCandidates: data.candidates?.length > 0 ? data.candidates : state.swingCandidates,
+				swingPositions: data.positions?.length > 0 ? data.positions : state.swingPositions,
+				swingConfig: data.config || state.swingConfig  // V8: Include cached config
+			}));
+		} catch (e) {
+			console.warn('[Trading] Failed to fetch swing state:', e);
+		}
+	}
+
 	function connect() {
 		if (ws?.readyState === WebSocket.OPEN) return;
 
@@ -702,11 +825,14 @@ function createTradingStore() {
 				// Start stale data detection
 				startStaleCheck();
 
-				// Subscribe to all trader topics
+				// Subscribe to all trader topics + swing trading topics
 				ws?.send(JSON.stringify({
 					type: 'subscribe',
-					topics: ['trader/#']
+					topics: ['trader/#', 'momentum/swing/#']
 				}));
+
+				// V8: Fetch swing state as backup (retained MQTT messages might be missed)
+				fetchSwingState();
 			};
 
 			ws.onmessage = (event) => {
@@ -870,12 +996,42 @@ function createTradingStore() {
 		});
 	}
 
-	// V7.29: Update budget allocation
-	function updateBudgetAllocation(stockPct: number, forexPct: number, enforceLimits: boolean) {
-		return sendCommand('trader/control/config/budget', {
+	// V7.29: Update budget allocation (V8: includes swing allocation)
+	function updateBudgetAllocation(
+		stockPct: number,
+		forexPct: number,
+		swingPct: number,
+		enforceLimits: boolean
+	) {
+		// Validate: Stock + Forex + Swing + Reserve = 100%
+		const reservePct = 100 - stockPct - forexPct - swingPct;
+		if (reservePct < 0) {
+			console.error('Budget allocation exceeds 100%');
+			return false;
+		}
+
+		// Send to trader for stock/forex
+		sendCommand('trader/control/config/budget', {
 			stock_budget_pct: stockPct,
 			forex_budget_pct: forexPct,
+			swing_budget_pct: swingPct,
 			enforce_limits: enforceLimits,
+			source: 'dashboard'
+		});
+
+		// Also update swing config with new budget
+		sendCommand('trader/control/swing/config', {
+			budget_pct: swingPct,
+			source: 'dashboard'
+		});
+
+		return true;
+	}
+
+	// V8: Update swing trading configuration
+	function updateSwingConfig(config: Partial<SwingConfig>) {
+		return sendCommand('trader/control/swing/config', {
+			...config,
 			source: 'dashboard'
 		});
 	}
@@ -899,7 +1055,9 @@ function createTradingStore() {
 		// V7.26: Position size limits
 		updatePositionLimits,
 		// V7.29: Budget allocation
-		updateBudgetAllocation
+		updateBudgetAllocation,
+		// V8: Swing trading config
+		updateSwingConfig
 	};
 }
 
@@ -963,6 +1121,68 @@ export const topPositions = derived(trading, ($trading) => {
 
 export const hasErrors = derived(trading, ($trading) => {
 	return ($trading.errors?.errors_1h ?? 0) > 0;
+});
+
+// ==================== SWING TRADING DERIVED STORES ====================
+
+export type SwingStatusValue = 'RUNNING' | 'SCANNING' | 'STOPPED' | 'ERROR' | 'OFFLINE' | 'UNKNOWN';
+
+export interface SwingStatusInfo {
+	status: SwingStatusValue;
+	lastScan: string | null;
+	candidatesFound: number;
+	activePositions: number;
+	mlLoaded: boolean;
+	uptimeSeconds: number | null;
+	isStale: boolean;
+}
+
+export const swingStatus = derived(trading, ($trading): SwingStatusInfo => {
+	const heartbeat = $trading.swingHeartbeat;
+
+	if (!heartbeat) {
+		return {
+			status: 'OFFLINE',
+			lastScan: null,
+			candidatesFound: 0,
+			activePositions: 0,
+			mlLoaded: false,
+			uptimeSeconds: null,
+			isStale: true
+		};
+	}
+
+	// Check if data is stale (no heartbeat for 3+ minutes)
+	const lastUpdate = heartbeat.timestamp ? new Date(heartbeat.timestamp).getTime() : 0;
+	const isStale = (Date.now() - lastUpdate) > 180_000;
+
+	let status: SwingStatusValue;
+	switch (heartbeat.status) {
+		case 'running':
+			status = 'RUNNING';
+			break;
+		case 'scanning':
+			status = 'SCANNING';
+			break;
+		case 'error':
+			status = 'ERROR';
+			break;
+		case 'stopped':
+			status = 'STOPPED';
+			break;
+		default:
+			status = isStale ? 'OFFLINE' : 'UNKNOWN';
+	}
+
+	return {
+		status,
+		lastScan: heartbeat.last_scan_time,
+		candidatesFound: heartbeat.last_scan_candidates,
+		activePositions: heartbeat.active_positions,
+		mlLoaded: heartbeat.ml_model_loaded,
+		uptimeSeconds: heartbeat.uptime_seconds,
+		isStale
+	};
 });
 
 // ==================== TRADER STATUS (with stale detection) ====================

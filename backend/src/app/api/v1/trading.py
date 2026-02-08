@@ -42,6 +42,8 @@ MQTT_TOPICS = [
     "trader/config/#",
     # V7.25: Historical Statistics
     "trader/history/#",
+    # V8: Swing Trading
+    "momentum/swing/#",
 ]
 
 
@@ -58,6 +60,14 @@ class TradingConnectionManager:
         # Format: {topic: {"payload": ..., "received_at": ...}}
         self._retained_messages: dict[str, dict[str, Any]] = {}
         self._retained_lock = threading.Lock()  # Thread-safe access from MQTT callback
+        # V8: Swing config cache (persists until backend restart)
+        self._swing_config: dict[str, Any] = {
+            "enabled": True,
+            "budget_pct": 20,
+            "max_positions": 5,
+            "max_position_size": 5000,
+            "auto_entry": False
+        }
 
     def _setup_mqtt(self) -> None:
         """Setup MQTT client for trader topics."""
@@ -276,6 +286,14 @@ async def trading_websocket(
                                 qos=2
                             )
                             logger.info(f"Published control message to {topic}")
+                            # V8: Cache swing config locally for persistence
+                            if topic == "trader/control/swing/config":
+                                trading_manager._swing_config.update({
+                                    k: v for k, v in payload.items()
+                                    if k in ("enabled", "budget_pct", "max_positions",
+                                             "max_position_size", "auto_entry")
+                                })
+                                logger.info(f"Cached swing config: {trading_manager._swing_config}")
                         except Exception as e:
                             logger.error(f"Failed to publish to {topic}: {e}")
 
@@ -298,3 +316,36 @@ async def trading_status() -> dict[str, Any]:
         "mqtt_broker": MQTT_BROKER,
         "subscribed_topics": MQTT_TOPICS,
     }
+
+
+@router.get("/swing/state")
+async def get_swing_state() -> dict[str, Any]:
+    """Get cached swing trading state from retained MQTT messages.
+
+    Returns the last known state for swing trading, useful when
+    WebSocket reconnects and might miss retained messages.
+    """
+    with trading_manager._retained_lock:
+        retained = dict(trading_manager._retained_messages)
+
+    result: dict[str, Any] = {
+        "heartbeat": None,
+        "candidates": [],
+        "positions": [],
+        "config": trading_manager._swing_config,  # V8: Include cached config
+        "timestamp": None,
+    }
+
+    # Extract swing data from retained messages
+    for topic, data in retained.items():
+        if topic == "momentum/swing/heartbeat":
+            result["heartbeat"] = data.get("payload")
+            result["timestamp"] = data.get("timestamp")
+        elif topic == "momentum/swing/candidates":
+            payload = data.get("payload", {})
+            result["candidates"] = payload.get("candidates", [])
+        elif topic == "momentum/swing/positions":
+            payload = data.get("payload", {})
+            result["positions"] = payload.get("positions", [])
+
+    return result
